@@ -55,10 +55,15 @@ are needed by the skill itself.
 | `/ddd` or "what should I work on next?" | Sync, then a ranked menu with reasons; builds what you pick |
 | `/ddd auto` (or `/ddd auto 3`) | Sync, then builds `[next]` items in doc order until the queue is empty, it needs your input, or N items are done |
 | `/ddd status` | Sync and report; builds nothing |
+| `/ddd initialize` | Surveys the code and drafts the first plan for you, as a Markdown file or a Google Doc (you choose), then sets up |
 | `/ddd setup` | First-run setup (also automatic) |
 
-On the first run it asks for your doc (a repo path or a Google Docs URL) and
-can drop in [a template](skills/ddd/templates/plan.md).
+On the first run it asks for your doc (a repo path or a Google Docs URL). No
+plan yet? `/ddd initialize` reviews the project (README, manifests, entry
+points, tests, CI, `TODO`/`FIXME`s, git history) and writes one: current
+features as context, known issues, planned features with tasks, `Done when:`
+lines and tags, and open questions. It never queues work for you; it suggests
+what to mark `[next]`. Or start from [the blank template](skills/ddd/templates/plan.md).
 
 ### Writing the doc
 
@@ -123,7 +128,7 @@ keep editing, rank higher in the menu. See
 skills/ddd/
   SKILL.md               the skill (what the agent reads)
   scripts/ddd.py         state tracker: parsing, matching, ranking, git helpers
-  references/            doc format, matching, backends, git workflow, state format
+  references/            doc format, initialize, matching, backends, git workflow, state format
   templates/plan.md      starter planning doc
 evals/
   matching/              before/after doc pairs with expected matches

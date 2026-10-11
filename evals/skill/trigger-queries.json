@@ -9,6 +9,8 @@
   {"query": "what's the status of the items in the plan? anything waiting on review?", "should_trigger": true},
   {"query": "set up doc-driven development for this repo", "should_trigger": true},
   {"query": "keep building features from my plan doc until you hit a question", "should_trigger": true},
+  {"query": "ddd initialize", "should_trigger": true},
+  {"query": "look through this repo and draw up a plan doc we can work from with ddd", "should_trigger": true},
   {"query": "explain domain-driven design aggregates", "should_trigger": false},
   {"query": "write documentation for this module", "should_trigger": false},
   {"query": "summarize this google doc for me", "should_trigger": false},

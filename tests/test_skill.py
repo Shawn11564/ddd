@@ -70,7 +70,7 @@ class SkillPackaging(unittest.TestCase):
         docs = self.text
         with open(os.path.join(SKILL_DIR, "references", "state-format.md"), encoding="utf-8") as f:
             docs += f.read()
-        modes = {"menu", "auto", "status", "setup"}  # skill invocations, not script commands
+        modes = {"menu", "auto", "status", "setup", "initialize"}  # skill invocations, not script commands
         used = set(re.findall(r"`ddd ([a-z][a-z-]*)", docs)) - modes
         self.assertEqual(used - known, set(), "SKILL.md mentions unknown commands")
 

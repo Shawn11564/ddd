@@ -105,6 +105,34 @@
         "Reports the changed-after-build conflict for subtract (branch ddd/subtract)",
         "Asks whether to rebuild or keep as built before touching the branch"
       ]
+    },
+    {
+      "id": 10,
+      "name": "initialize-markdown",
+      "setup": "Fresh tiny-app repo with docs/plan.md deleted (commit the deletion); no .ddd/.",
+      "prompt": "ddd initialize",
+      "expectations": [
+        "Runs `ddd.py survey` and reads calc.py and test_calc.py before drafting",
+        "Asks in one message whether the plan should be a Markdown file or a Google Doc, and nothing it could work out from the code",
+        "After the answer 'markdown', writes docs/plan.md and validates the draft with `ddd.py parse`",
+        "The plan lists add() under a Current features [notes] section, has planned features as H2 headings with - [ ] tasks, Done when: lines and {#tags}, and contains no [next] marker and no DDD Status section",
+        "Every planned item cites evidence or sits under Ideas [notes]; no invented product features outside Ideas",
+        "Runs `ddd.py init --doc docs/plan.md`, the first sync and `commit-state`; does not commit docs/plan.md",
+        "Reports the items it would queue first with [next] instead of queuing them"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "initialize-google-doc",
+      "setup": "As eval 10, with a Google Drive MCP connected that can create files from Markdown with conversion to a Google Doc.",
+      "prompt": "ddd initialize - put the plan in a google doc",
+      "expectations": [
+        "Does not ask Markdown or Google Doc again (already answered)",
+        "Creates one Google Doc from the Markdown draft with conversion, titled '<project> plan' unless told otherwise",
+        "Reads the new doc back, runs `ddd.py parse` on the read-back and compares it with the draft; reports anything lost",
+        "Runs `ddd.py init --doc <the doc URL>` and records the probed capabilities",
+        "Creates no local docs/plan.md"
+      ]
     }
   ]
 }

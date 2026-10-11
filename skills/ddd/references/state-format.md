@@ -79,7 +79,8 @@ commits": `ddd log --item login`.
 |---|---|
 | `init --doc PATH\|URL [--base B] [--test CMD] [--force]` | Create `.ddd/` |
 | `info` | Config, state counts, flags, git branch and dirty files |
-| `parse FILE` | Parse a doc and print its items (no state needed; for debugging) |
+| `parse FILE` | Parse a doc and print its items (no state needed; for debugging and validating drafts) |
+| `survey [--limit N]` | Facts about the project for Initialize mode: stack, manifests, tests, CI, docs, code markers, git (no state needed) |
 | `diff [FILE]` | Compare the doc with the last sync; saves a pending diff |
 | `accept [--match K=ID] [--new K] [--split ID=K,K] [--merge ID,ID=K] [--accept-proposed]` | Apply the pending diff |
 | `rank [--queued] [--limit N]` | Work candidates with signals; `--queued` for auto mode |

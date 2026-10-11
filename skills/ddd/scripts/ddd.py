@@ -1383,6 +1383,125 @@ def cmd_log(args):
     emit({"entries": rows[-args.limit:] if args.limit else rows})
 
 
+# --------------------------------------------------------------------------
+# survey: facts about the project for Initialize mode (no .ddd/ needed)
+
+SKIP_DIRS = {".git", ".ddd", "node_modules", ".venv", "venv", "env", "__pycache__", "dist",
+             "build", "target", "out", "bin", "obj", ".idea", ".vscode", ".gradle", "vendor",
+             ".next", ".nuxt", "coverage", ".tox", ".mypy_cache", ".pytest_cache"}
+MANIFESTS = ("package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+             "Pipfile", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
+             "settings.gradle", "settings.gradle.kts", "Gemfile", "composer.json", "CMakeLists.txt",
+             "Makefile", "Dockerfile", "docker-compose.yml", "compose.yaml", "mix.exs",
+             "pubspec.yaml", "Package.swift", "deno.json", "tsconfig.json")
+CI_PATTERNS = (r"^\.github/workflows/[^/]+\.ya?ml$", r"^\.gitlab-ci\.yml$", r"^\.circleci/",
+               r"^Jenkinsfile$", r"^azure-pipelines\.yml$", r"^\.travis\.yml$")
+PLAN_NAME = re.compile(r"(plan|roadmap|todo|backlog|spec|milestone)", re.I)
+TEST_PATH = re.compile(r"(^|/)(tests?|spec|__tests__)(/|$)|(^|/)test_[^/]+$|_test\.[^/]+$|"
+                       r"\.(test|spec)\.[^/]+$|Tests?\.[^/]+$")
+CODE_MARKER = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b(?:\([^)]*\))?(?::|\s|$)(.*)")
+
+
+def project_files(root):
+    if git(root, "rev-parse", "--git-dir", check=False)[0] == 0:
+        _, out = git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z", check=False)
+        files = [f for f in out.split("\0") if f]
+        return sorted(f for f in files
+                      if not any(part in SKIP_DIRS for part in f.split("/")[:-1])
+                      and os.path.isfile(os.path.join(root, f)))
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        rel = os.path.relpath(dirpath, root).replace("\\", "/")
+        files.extend(fn if rel == "." else rel + "/" + fn for fn in filenames)
+    return sorted(files)
+
+
+def read_small_text(path, limit=1_000_000):
+    """Text of a file, or None for large or binary files."""
+    try:
+        if os.path.getsize(path) > limit:
+            return None
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if b"\0" in raw[:8192]:
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+def survey_git(root):
+    if git(root, "rev-parse", "--git-dir", check=False)[0] != 0:
+        return {"repo": False}
+    info = {"repo": True}
+    code, branch = git(root, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    info["branch"] = branch if code == 0 else None
+    code, count = git(root, "rev-list", "--count", "HEAD", check=False)
+    info["commits"] = int(count) if code == 0 and count.isdigit() else 0
+    if info["commits"]:
+        _, first = git(root, "log", "--reverse", "--format=%cs", check=False)
+        _, recent = git(root, "log", "-15", "--format=%cs %s", check=False)
+        info["first_commit"] = first.splitlines()[0] if first else None
+        info["recent"] = recent.splitlines()
+        _, unmerged = git(root, "branch", "--no-merged", "HEAD", "--format=%(refname:short)", check=False)
+        info["unmerged_branches"] = [b for b in unmerged.splitlines() if b.strip()]
+    _, status = git(root, "status", "--porcelain", check=False)
+    info["dirty_files"] = len([l for l in status.splitlines() if l.strip()])
+    return info
+
+
+def cmd_survey(args):
+    root = os.path.abspath(args.root or os.getcwd())
+    files = project_files(root)
+    exts, top = {}, {}
+    for f in files:
+        ext = os.path.splitext(f)[1].lower() or os.path.basename(f)
+        exts[ext] = exts.get(ext, 0) + 1
+        head = f.split("/")[0] + ("/" if "/" in f else "")
+        top[head] = top.get(head, 0) + 1
+    base = lambda f: f.rsplit("/", 1)[-1]  # noqa: E731
+    docs = sorted((f for f in files if f.lower().endswith((".md", ".rst", ".txt", ".adoc"))),
+                  key=lambda f: (f.count("/"), f))
+    markers, total = [], 0
+    for f in files:
+        text = read_small_text(os.path.join(root, f))
+        if text is None:
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            m = CODE_MARKER.search(line)
+            if m:
+                total += 1
+                if len(markers) < args.limit:
+                    markers.append({"path": f, "line": n, "tag": m.group(1),
+                                    "text": m.group(2).strip()[:160]})
+    scripts = None
+    if "package.json" in files:
+        try:
+            scripts = sorted((json.loads(read_text(os.path.join(root, "package.json"))).get("scripts") or {}))
+        except (ValueError, AttributeError):
+            scripts = None
+    tests = [f for f in files if TEST_PATH.search(f)]
+    emit({
+        "root": root,
+        "name": os.path.basename(root),
+        "ddd_initialised": os.path.exists(os.path.join(root, STATE_DIR, "config.json")),
+        "git": survey_git(root),
+        "files": len(files),
+        "extensions": dict(sorted(exts.items(), key=lambda kv: -kv[1])[:15]),
+        "top_level": dict(sorted(top.items())),
+        "manifests": [f for f in files if base(f) in MANIFESTS and f.count("/") <= 2]
+                     + [f for f in files if f.endswith((".csproj", ".sln")) and f.count("/") <= 2],
+        "package_scripts": scripts,
+        "tests": {"files": len(tests), "sample": tests[:20]},
+        "ci": [f for f in files if any(re.search(p, f) for p in CI_PATTERNS)],
+        "readme": [f for f in files if base(f).lower().startswith("readme") and f.count("/") <= 1],
+        "docs": docs[:30],
+        "plan_candidates": [f for f in docs if PLAN_NAME.search(base(f))],
+        "code_markers": {"total": total, "items": markers},
+    })
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="ddd.py", description="Document-Driven Development state tracker")
     p.add_argument("--root", help="project root (default: nearest parent with .ddd/)")
@@ -1401,6 +1520,10 @@ def build_parser():
     s = sub.add_parser("parse", help="parse a doc and print its items (no state needed)")
     s.add_argument("file")
     s.set_defaults(func=cmd_parse)
+
+    s = sub.add_parser("survey", help="facts about the project for drafting a plan (no state needed)")
+    s.add_argument("--limit", type=int, default=200, help="max code markers (TODO, FIXME, ...) listed")
+    s.set_defaults(func=cmd_survey)
 
     s = sub.add_parser("diff", help="compare the doc with the last sync")
     s.add_argument("file", nargs="?", help="doc text (required for Google Docs)")

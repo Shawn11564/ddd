@@ -6,7 +6,8 @@ Run from the repo root:  python -m unittest discover -s tests -v
   expect.json); see evals/README.md for the format.
 - ParserTests covers the doc conventions in references/doc-format.md.
 - WorkflowTests drives the CLI end to end in a throwaway git repo: sync,
-  rank, start, commit, finish, status write, merge and squash-merge detection.
+  rank, start, commit, finish, status write, merge and squash-merge detection,
+  plus `survey` and the Initialize draft structure.
 """
 
 import json
@@ -429,6 +430,88 @@ class WorkflowTests(unittest.TestCase):
         os.makedirs(os.path.join(self.root, ".ddd", "tmp"), exist_ok=True)
         self.write(".ddd/tmp/doc.md", self.PLAN)
         self.assertEqual(self.ddd("diff", ".ddd/tmp/doc.md")["summary"]["new"], 5)
+
+    def test_survey_reports_project_facts(self):
+        os.makedirs(os.path.join(self.root, "src"))
+        os.makedirs(os.path.join(self.root, "tests"))
+        os.makedirs(os.path.join(self.root, "node_modules", "dep"))
+        os.makedirs(os.path.join(self.root, ".github", "workflows"))
+        self.write("package.json", '{"name": "app", "scripts": {"test": "jest", "build": "tsc"}}')
+        self.write("src/app.js", "// TODO: handle empty input\nlet TODO_LIST = [];\n// FIXME(sam) leaks\n")
+        self.write("tests/app.test.js", "test('x', () => {});\n")
+        self.write("node_modules/dep/index.js", "// TODO: vendored, must be skipped\n")
+        self.write(".github/workflows/ci.yml", "on: push\n")
+        self.write("ROADMAP.md", "# Roadmap\n")
+        self.write("README.md", "# App\n")
+        with open(os.path.join(self.root, "blob.bin"), "wb") as f:
+            f.write(b"\0TODO: binary\n")
+        self.write(".gitignore", "ignored/\n")
+        os.makedirs(os.path.join(self.root, "ignored"))
+        self.write("ignored/x.js", "// TODO: gitignored\n")
+        self.git("checkout", "-q", "-b", "wip")
+        self.git("commit", "-q", "--allow-empty", "-m", "wip")
+        self.git("checkout", "-q", "main")
+        s = self.ddd("survey")
+        self.assertFalse(s["ddd_initialised"])
+        self.assertEqual(s["git"]["branch"], "main")
+        self.assertEqual(s["git"]["unmerged_branches"], ["wip"])
+        self.assertIn("package.json", s["manifests"])
+        self.assertEqual(s["package_scripts"], ["build", "test"])
+        self.assertIn("tests/app.test.js", s["tests"]["sample"])
+        self.assertEqual(s["ci"], [".github/workflows/ci.yml"])
+        self.assertIn("README.md", s["readme"])
+        self.assertIn("ROADMAP.md", s["plan_candidates"])
+        self.assertIn("plan.md", s["plan_candidates"])
+        found = [(m["path"], m["line"], m["tag"], m["text"]) for m in s["code_markers"]["items"]]
+        self.assertEqual(found, [("src/app.js", 1, "TODO", "handle empty input"),
+                                 ("src/app.js", 3, "FIXME", "leaks")])
+        self.assertFalse(any(p.startswith(("node_modules/", "ignored/")) for p in s["top_level"]))
+        self.ddd("init", "--doc", "plan.md")
+        self.assertTrue(self.ddd("survey")["ddd_initialised"])
+
+    def test_survey_without_git(self):
+        plain = tempfile.mkdtemp(prefix="ddd-nogit-")
+        try:
+            os.makedirs(os.path.join(plain, "venv"))
+            with open(os.path.join(plain, "main.py"), "w", encoding="utf-8") as f:
+                f.write("# HACK: temporary\n")
+            with open(os.path.join(plain, "venv", "lib.py"), "w", encoding="utf-8") as f:
+                f.write("# TODO: skipped\n")
+            out = subprocess.run([sys.executable, SCRIPT, "--root", plain, "survey"], capture_output=True)
+            s = json.loads(out.stdout.decode("utf-8"))
+            self.assertFalse(s["git"]["repo"])
+            self.assertEqual(s["files"], 1)
+            self.assertEqual(s["code_markers"]["total"], 1)
+        finally:
+            shutil.rmtree(plain, ignore_errors=True)
+
+    def test_initialize_draft_structure_syncs(self):
+        """The plan structure in references/initialize.md parses as the guide
+        promises: context sections are notes, built parts start done, and only
+        planned work is offered."""
+        guide = ddd.read_text(os.path.join(REPO, "skills", "ddd", "references", "initialize.md"))
+        draft = guide.split("```markdown\n", 1)[1].split("\n```", 1)[0] + "\n"
+        doc = ddd.parse_doc(draft)
+        self.assertEqual(doc["warnings"], [])
+        items = {it["title"]: it for it in doc["items"]}
+        for section in ("Overview", "Current features", "Open questions", "Ideas"):
+            self.assertIn("notes", items[section]["markers"], section)
+        tagged = next(it for it in doc["items"] if it["tag"] == "task-tag")
+        self.assertEqual(tagged["acceptance"], ["<observable, testable result>"])
+        by_key = {it["key"]: it for it in doc["items"]}
+        self.assertEqual(by_key[tagged["parent"]]["tag"], "feature-tag")
+        os.makedirs(os.path.join(self.root, "docs"))
+        self.write("docs/plan.md", draft)
+        self.ddd("init", "--doc", "docs/plan.md", "--force")
+        self.assertFalse(self.ddd("diff")["needs_input"])
+        self.ddd("accept")
+        built = [r for r in self.ddd("items")["items"] if r["title"] == "<Part that already exists>"]
+        self.assertEqual([r["state"] for r in built], ["done"])
+        offered = {c["title"] for c in self.ddd("rank", "--limit", "50")["candidates"]}
+        self.assertIn("<Task>", offered)
+        self.assertTrue(any(t.startswith("<Fix") for t in offered))
+        self.assertFalse(offered & {"Overview", "Current features", "Open questions", "Ideas"})
+        self.assertEqual(self.ddd("rank", "--queued")["candidates"], [])
 
 
 if __name__ == "__main__":
