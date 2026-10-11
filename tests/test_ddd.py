@@ -877,6 +877,7 @@ class WorkflowTests(unittest.TestCase):
         promises: context sections are notes, built parts start done, and only
         planned work is offered."""
         guide = ddd.read_text(os.path.join(REPO, "skills", "ddd", "references", "initialize.md"))
+        guide = guide.replace("\r\n", "\n")  # a Windows checkout (text=auto) has CRLF
         draft = guide.split("```markdown\n", 1)[1].split("\n```", 1)[0] + "\n"
         doc = ddd.parse_doc(draft)
         self.assertEqual(doc["warnings"], [])
