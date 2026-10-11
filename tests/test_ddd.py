@@ -146,6 +146,27 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(items["Button"]["acceptance"], ["it is visible"])
         self.assertEqual(items["Icon"]["parent"], items["Button"]["key"])
 
+    def test_tag_line_under_heading(self):
+        items = self.parse("## Finish Clash\n\n{#clash} [next]\n\nWhy.\n\n- [ ] Kits\n\n"
+                           "## Cards\n{\\#cards} \\[blocked\\]\nBody\n")
+        self.assertEqual(items["Finish Clash"]["tag"], "clash")
+        self.assertEqual(items["Finish Clash"]["markers"], ["next"])
+        self.assertEqual(items["Finish Clash"]["body"], "Why.")
+        self.assertEqual(items["Kits"]["inherited"], ["next"])
+        self.assertEqual((items["Cards"]["tag"], items["Cards"]["markers"]), ("cards", ["blocked"]))
+
+    def test_tag_line_only_right_under_heading(self):
+        items = self.parse("## A\n\nBody first.\n\n{#late}\n\n## B\n\n- [ ] Task\n\n{#also-late}\n")
+        self.assertIsNone(items["A"]["tag"])
+        self.assertIn("{#late}", items["A"]["body"])
+        self.assertIsNone(items["B"]["tag"])
+
+    def test_tag_line_keeps_heading_tag(self):
+        doc = ddd.parse_doc("## A {#first}\n\n{#second} [notes]\n")
+        self.assertEqual(doc["items"][0]["tag"], "first")
+        self.assertEqual(doc["items"][0]["markers"], ["notes"])
+        self.assertEqual(len(doc["warnings"]), 1)
+
     def test_code_fences_are_body(self):
         items = self.parse("## Setup\n\n```\n# not a heading\n- [ ] not a task\n```\n")
         self.assertEqual(list(items), ["Setup"])
@@ -173,6 +194,73 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(out.rstrip().endswith("more"))
         appended = ddd.replace_status("## A\n", "## DDD Status\n\nnew\n", "DDD Status")
         self.assertEqual(appended, "## A\n\n## DDD Status\n\nnew\n")
+
+
+class DocInputTests(unittest.TestCase):
+    """Doc text from files the agent did not have to retype: saved connector
+    results and base64 exports."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ddd-input-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def path(self, name, text):
+        p = os.path.join(self.dir, name)
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return p
+
+    def test_inputs(self):
+        md = "# Plan\n\n## A ✓\n\n- [ ] Task\n"
+        b64 = ddd.base64.b64encode(md.encode("utf-8")).decode("ascii")
+        cases = {
+            "plain.md": md,
+            "doc.b64": b64[:20] + "\n" + b64[20:] + "\n",
+            "result.json": json.dumps({"content": b64, "mimeType": "text/markdown"}),
+            "wrapped.json": json.dumps([{"type": "text", "text": json.dumps({"content": b64})}]),
+            "text.json": json.dumps({"content": md}),
+            "string.json": json.dumps(json.dumps({"content": b64})),
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(ddd.read_doc_input(self.path(name, text)), md)
+
+    def test_markdown_that_looks_like_json_is_kept(self):
+        md = "[notes] intro\n\n## A\n"
+        self.assertEqual(ddd.read_doc_input(self.path("doc.md", md)), md)
+
+    def test_bad_base64(self):
+        with self.assertRaises(ddd.DddError):
+            ddd.read_doc_input(self.path("doc.b64", "not base64!"))
+
+
+class GoogleImportTests(unittest.TestCase):
+    """Real Google Docs round trips, see tests/fixtures/gdoc-import/README.md."""
+    FIX = os.path.join(REPO, "tests", "fixtures", "gdoc-import")
+
+    def load(self, name):
+        return ddd.parse_doc(ddd.read_doc_input(os.path.join(self.FIX, name)))
+
+    def test_heading_tags_are_cut_but_tag_lines_survive(self):
+        source, export = self.load("placements.source.md"), self.load("placements.export.json")
+        src = {it["title_norm"]: it for it in source["items"]}
+        out = {it["title_norm"]: it for it in export["items"]}
+        for title in ("alpha trailing", "beta before marker", "delta escaped", "iota trailing space"):
+            self.assertTrue(src[title]["tag"])
+            self.assertIsNone(out[title]["tag"], title)
+        self.assertEqual(out["beta before marker"]["markers"], [])  # the marker after the tag is gone too
+        self.assertEqual(out["epsilon tag line below"]["tag"], "epsilon")
+        self.assertEqual(out["theta marker only"]["markers"], ["blocked"])
+        tasks = {it["title"]: it for it in export["items"] if it["kind"] == "task"}
+        self.assertEqual(tasks["Task with tag"]["tag"], "mu-task")
+        self.assertEqual(tasks["Task with tag"]["acceptance"], ["it works"])
+        self.assertTrue(tasks["Done task"]["checked"])
+
+    def test_recommended_layout_round_trips(self):
+        result = ddd.compare_docs(self.load("layout.source.md"), self.load("layout.export.json"))
+        self.assertTrue(result["same"], result)
+        tags = {it["tag"] for it in self.load("layout.export.json")["items"] if it["tag"]}
+        self.assertEqual(tags, {"fixes", "fix-sims", "fixed-thing", "clash", "clash-kits", "clash-cards"})
 
 
 class WorkflowTests(unittest.TestCase):
@@ -431,6 +519,52 @@ class WorkflowTests(unittest.TestCase):
         self.write(".ddd/tmp/doc.md", self.PLAN)
         self.assertEqual(self.ddd("diff", ".ddd/tmp/doc.md")["summary"]["new"], 5)
 
+    def test_gdoc_version_skips_fetch(self):
+        self.ddd("init", "--doc", "https://docs.google.com/document/d/abc123_X/edit", "--force")
+        os.makedirs(os.path.join(self.root, ".ddd", "tmp"), exist_ok=True)
+        self.write(".ddd/tmp/doc.md", self.PLAN)
+        self.assertTrue(self.ddd("diff", "--doc-version", "v1")["fetch_needed"])  # never synced
+        self.ddd("diff", ".ddd/tmp/doc.md", "--doc-version", "v1")
+        self.assertTrue(self.ddd("diff", "--doc-version", "v1")["fetch_needed"])  # pending, not accepted
+        self.ddd("accept")
+        quick = self.ddd("diff", "--doc-version", "v1")
+        self.assertTrue(quick["fetch_skipped"])
+        self.assertTrue(quick["doc_unchanged"])
+        self.assertFalse(quick["needs_input"])
+        self.assertTrue(self.ddd("diff", "--doc-version", "v2")["fetch_needed"])
+        # Same text under a new version (a comment, the agent's own status write):
+        # the version is remembered without an accept.
+        self.assertTrue(self.ddd("diff", ".ddd/tmp/doc.md", "--doc-version", "v2")["doc_unchanged"])
+        self.assertTrue(self.ddd("diff", "--doc-version", "v2")["fetch_skipped"])
+
+    def test_test_command_warning(self):
+        self.write("gradlew", "#!/bin/sh\n")
+        warned = self.ddd("init", "--doc", "plan.md", "--test", "gradlew test --console=plain")
+        self.assertEqual(len(warned["warnings"]), 1)
+        self.assertIn("./gradlew", warned["warnings"][0])
+        self.assertEqual(self.ddd("config", "set", "test_command", "./gradlew test")["warnings"], [])
+        self.assertEqual(self.ddd("config", "set", "test_command", "git status")["warnings"], [])
+        self.assertEqual(len(self.ddd("config", "set", "test_command", "gradlew test")["warnings"]), 1)
+
+    def test_commit_state_off_base_explains(self):
+        self.init_and_sync()
+        self.git("checkout", "-q", "-b", "feature")
+        err = self.ddd("commit-state", code=1)["error"]
+        self.assertIn("main", err)
+        self.assertIn("git add", err)
+
+    def test_parse_outline_and_compare(self):
+        self.write("a.md", "# Plan\n\n## Auth\n\n{#auth} [next]\n\n- [ ] Login\n  - Done when: it works\n")
+        self.write("b.md", "# Plan\n\n## Auth\n\n- [x] Login\n  - Done when: it works\n")
+        out = self.ddd("parse", "a.md", "--outline")["outline"]
+        self.assertEqual(out, ["# Plan", "  # Auth {#auth} [next]", "    [ ] Login (done when: 1)"])
+        cmp = self.ddd("parse", "a.md", "--compare", "b.md")
+        self.assertFalse(cmp["same"])
+        by_title = {d["title"]: d for d in cmp["differences"]}
+        self.assertEqual(by_title["Auth"]["tag"], ["auth", None])
+        self.assertEqual(by_title["Login"]["checked"], [False, True])
+        self.assertTrue(self.ddd("parse", "a.md", "--compare", "a.md")["same"])
+
     def test_survey_reports_project_facts(self):
         os.makedirs(os.path.join(self.root, "src"))
         os.makedirs(os.path.join(self.root, "tests"))
@@ -455,6 +589,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(s["ddd_initialised"])
         self.assertEqual(s["git"]["branch"], "main")
         self.assertEqual(s["git"]["unmerged_branches"], ["wip"])
+        self.assertEqual((s["git"]["base_guess"], s["git"]["on_base"]), ("main", True))
         self.assertIn("package.json", s["manifests"])
         self.assertEqual(s["package_scripts"], ["build", "test"])
         self.assertIn("tests/app.test.js", s["tests"]["sample"])
@@ -505,7 +640,7 @@ class WorkflowTests(unittest.TestCase):
         self.ddd("init", "--doc", "docs/plan.md", "--force")
         self.assertFalse(self.ddd("diff")["needs_input"])
         self.ddd("accept")
-        built = [r for r in self.ddd("items")["items"] if r["title"] == "<Part that already exists>"]
+        built = [r for r in self.ddd("items")["items"] if r["title"] == "<Part that already exists on the base branch>"]
         self.assertEqual([r["state"] for r in built], ["done"])
         offered = {c["title"] for c in self.ddd("rank", "--limit", "50")["candidates"]}
         self.assertIn("<Task>", offered)

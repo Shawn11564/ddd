@@ -24,3 +24,4 @@
 - Run all checks with `python -m unittest discover -s tests -v` (headless; creates throwaway git repos in the temp dir).
 - `skills/ddd/` is the shipped skill. Keep `SKILL.md` under 500 lines and its frontmatter within the Agent Skills spec (`tests/test_skill.py` checks this).
 - Matching changes must keep `evals/matching/` green; add a scenario for every matching bug you fix.
+- Every mode in the `SKILL.md` mode table needs a `commands/<mode>.md` (Claude Code's `/ddd:<mode>`). After changing `commands/` or the installers, also run `python evals/claude_code_commands.py` (needs the `claude` CLI).

@@ -1,0 +1,5 @@
+{"description": "Google Docs cuts a heading at its first '{', so the tag sits on its own line under the heading (exported escaped, with the marker). A heavy rename then keeps the item's identity by tag, with no question.",
+ "matched": {"Night theme": "dark-mode"},
+ "changes": {"Night theme": ["renamed"]},
+ "new": [], "removed": [], "ask": [],
+ "after_accept": {"ids": {"Night theme": "dark-mode"}, "states": {"Night theme": "todo"}}}

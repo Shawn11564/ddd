@@ -10,7 +10,8 @@ make it more predictable:
 - `[notes]` marks a section as context only, never work.
 - `{#short-tag}` pins an item's identity, so the agent keeps tracking it
   however much you reword or move it. Optional; untagged items are matched by
-  their text and position.
+  their text and position. In a Google Doc, put a heading's tag (and markers)
+  on its own line right under the heading: Google drops a `{` in a heading.
 - `Done when:` lines become the item's acceptance criteria.
 - Check a box yourself to tell the agent an item is done.
 

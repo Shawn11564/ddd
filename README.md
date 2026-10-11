@@ -30,7 +30,8 @@ history and audit trail in `.ddd/` in your repo.
 /plugin install ddd@ddd
 ```
 
-Plugin skills are namespaced: invoke it as `/ddd:ddd` (`/ddd:ddd auto`, ...).
+Plugin skills are namespaced: invoke it as `/ddd:ddd` (`/ddd:ddd auto`, ...),
+or use the per-mode commands `/ddd:auto`, `/ddd:status`, ... (see [Use](#use)).
 
 **Claude Code or Codex: copy the skill** (invoked as `/ddd`, or ask for "ddd")
 
@@ -57,6 +58,13 @@ are needed by the skill itself.
 | `/ddd status` | Sync and report; builds nothing |
 | `/ddd initialize` | Surveys the code and drafts the first plan for you, as a Markdown file or a Google Doc (you choose), then sets up |
 | `/ddd setup` | First-run setup (also automatic) |
+
+**Completion in Claude Code:** every mode is also its own command, so type
+`/ddd:` and the menu lists them all: `/ddd:menu`, `/ddd:auto [max-items]`,
+`/ddd:status`, `/ddd:setup [doc-path-or-url]`, `/ddd:initialize [markdown|gdoc]`.
+The plugin provides them; `install.sh`/`install.ps1` copy them to
+`~/.claude/commands/ddd/` (or `.claude/commands/ddd/` with `--target project`).
+Use one install method, not both, or each command is listed twice.
 
 On the first run it asks for your doc (a repo path or a Google Docs URL). No
 plan yet? `/ddd initialize` reviews the project (README, manifests, entry
@@ -101,7 +109,12 @@ The skill reads your doc through whatever Google Docs/Drive MCP your agent
 has. It only writes the status section if that MCP can edit part of a
 document. It never replaces the whole doc, which would wipe your formatting
 and race your edits. Without partial edits it uses comments; without comments
-it keeps status in `.ddd/` and its chat report. Details:
+it keeps status in `.ddd/` and its chat report.
+
+Syncing checks the doc's modified time first and fetches the text only when it
+changed, because fetching a Google Doc costs tokens in proportion to its size.
+Google's Markdown import cuts a heading at its first `{`, so in a Google Doc
+put a heading's tag on its own line under it (`{#auth} [next]`). Details:
 [backends.md](skills/ddd/references/backends.md).
 
 ## How it tracks your items
@@ -130,9 +143,11 @@ skills/ddd/
   scripts/ddd.py         state tracker: parsing, matching, ranking, git helpers
   references/            doc format, initialize, matching, backends, git workflow, state format
   templates/plan.md      starter planning doc
+commands/                one Claude Code command per mode (/ddd:auto, ...)
 evals/
   matching/              before/after doc pairs with expected matches
   skill/                 behaviour evals, trigger queries and a fixture project
+  claude_code_commands.py  checks a real Claude Code lists every /ddd:<mode>
 tests/                   unit, workflow and packaging tests
 .claude-plugin/          Claude Code plugin + marketplace manifests
 install.sh, install.ps1
@@ -146,7 +161,8 @@ python -m unittest discover -s tests -v
 
 This runs the parser tests, every matching scenario in `evals/matching/`,
 end-to-end git workflow tests in throwaway repos, and packaging checks
-(frontmatter within the Agent Skills spec, links, manifests). CI runs the same
+(frontmatter within the Agent Skills spec, links, manifests, one command per
+mode, both installers in throwaway directories). CI runs the same
 on Linux, macOS and Windows. See [evals/README.md](evals/README.md) for adding
 scenarios and running the behaviour evals.
 

@@ -55,11 +55,16 @@ or from the request:
 1. `ddd info`. If it reports no `.ddd/`, do [Setup](#setup) first.
 2. Get the doc text:
    - Markdown doc: nothing to do; `diff` reads the configured path.
-   - Google Doc: read it through the connected Google Docs/Drive MCP, preferring a
-     Markdown export, and save the exact text to `.ddd/tmp/doc.md`. Details and
-     fallbacks: [references/backends.md](references/backends.md).
-3. `ddd diff` (Google Doc: `ddd diff .ddd/tmp/doc.md`). If `doc_unchanged` is
-   true and `needs_input` false, skip to step 6.
+   - Google Doc: fetching costs a lot (you retype the whole doc), so check
+     first. Get the doc's modified time from the MCP's metadata tool and run
+     `ddd diff --doc-version <modifiedTime>`. If `fetch_skipped` is true, the
+     doc is unchanged: skip to step 6. Otherwise read it, preferring the
+     Markdown export, and save it to `.ddd/tmp/`. If the host saved the
+     result to a file, pass that file as is (JSON and base64 are decoded);
+     never retype a saved result. Details and fallbacks:
+     [references/backends.md](references/backends.md).
+3. `ddd diff` (Google Doc: `ddd diff <file> --doc-version <modifiedTime>`). If
+   `doc_unchanged` is true and `needs_input` false, skip to step 6.
 4. If `needs_input` is true, settle every open question with the developer in
    **one** short message before accepting. Never guess a match yourself.
    - `proposed`: an uncertain match ("Is 'Night theme' the old 'Dark mode'?").
@@ -109,9 +114,10 @@ For one item `ID`:
 
 1. **Test command.** `ddd info` shows `config.test_command`. If it is null,
    find the project's tests (package.json scripts, pytest, gradle, cargo, a
-   Makefile, ...). Confirm with the developer once, then
-   `ddd config set test_command "<cmd>"`. In auto mode with no test command,
-   that is a blocker.
+   Makefile, ...). Run it, confirm with the developer once, then record it
+   exactly as it ran: `ddd config set test_command "<cmd>"` (`./gradlew test`,
+   not `gradlew test`; heed any `warnings`). In auto mode with no test
+   command, that is a blocker.
 2. **Branch.** `ddd start ID` checks out `ddd/ID` from the base branch (or
    resumes it) and marks the item in progress. `.ddd/`, a local Markdown doc
    and untracked files never block it, and keep their content across branch
@@ -154,32 +160,44 @@ and formatting rules: [references/initialize.md](references/initialize.md).
 1. **Survey.** `ddd survey` (no `.ddd/` needed) lists the stack, manifests,
    tests, CI, docs, plan-like files, `TODO`/`FIXME` markers and git history.
    Then read the README, manifests, entry points and tests until you know what
-   the project does. If `ddd_initialised` is true, a plan already exists: ask
-   whether to replace it before going further.
+   the project does. On a large project, do the reading in a subagent that
+   returns the inventory (step 3), so design docs don't fill your context.
+   If `ddd_initialised` is true, a plan already exists: ask whether to
+   replace it before going further.
 2. **Ask once**, in one message: Markdown file in the repo (default
-   `docs/plan.md`) or Google Doc (title, default `<Project> plan`). Recommend
+   `docs/plan.md`) or Google Doc (title, default `<Project> plan`), unless the
+   arguments already say (`ddd initialize markdown`, `ddd initialize gdoc`). Recommend
    Markdown if no connected tool can create Google Docs. In the same message,
    raise any existing roadmap or TODO file you found (adopt it via
    [Setup](#setup) instead?) and ask if there is anything the plan must cover.
-   Draft the rest yourself; don't interview the developer.
+   If survey's `git.on_base` is false, say which branch you are on and that
+   `.ddd/` can only be committed from the base branch. Draft the rest
+   yourself; don't interview the developer.
 3. **Inventory** what is built, partial, broken (failing tests, `FIXME`s) and
    planned (roadmap lines, `TODO`s, unmerged branches). Every planned item
-   cites its evidence. Your own suggestions stay few; speculation goes under
-   `Ideas [notes]`.
+   cites its evidence. "Built" means on the base branch: work on other
+   branches or uncommitted is in progress, not done. Your own suggestions
+   stay few; speculation goes under `Ideas [notes]`.
 4. **Draft** in the structure from the guide: title and summary, `Overview` and
    `Current features` as `[notes]`, `Known issues`, one H2 per planned feature
    with `- [ ]` tasks, `Done when:` lines and `{#tags}`, then `Open questions`
    and `Ideas` as `[notes]`. No `[next]` (queuing is the developer's call) and
-   no `DDD Status` section.
-5. **Validate.** Save the draft outside the repo and run `ddd parse <draft>`:
-   no warnings, items and parents as intended, every context section `notes`.
+   no `DDD Status` section. Link design docs instead of copying them. For a
+   Google Doc, put each heading's tag and markers on their own line under it
+   (`{#clash} [blocked]`): Google cuts a heading at its first `{`.
+5. **Validate.** Save the draft outside the repo and run
+   `ddd parse <draft> --outline`: no warnings, items and parents as intended,
+   every context section `notes`.
 6. **Write.** Markdown: write the file; ask before overwriting one; leave it
-   uncommitted for the developer. Google Doc: create it from the Markdown with
-   conversion, read it back, `ddd parse` the read-back and compare it with the
-   draft. Report anything the conversion lost.
-7. **Set up.** `ddd init --doc <path-or-url> [--test "<cmd>"]`, then
+   uncommitted for the developer. Google Doc: create it **once** from the
+   Markdown with conversion, read it back and run
+   `ddd parse <draft> --compare <read-back>`. Report anything the conversion
+   lost; never create a second copy to retry, and never trash a doc.
+7. **Set up.** `ddd init --doc <path-or-url> --test "<cmd as it ran>"`, then
    [Setup](#setup) from step 4. Report the doc's path or link, its size, the
-   items you would queue first with `[next]`, and the open questions.
+   items you would queue first with `[next]`, and the open questions. If you
+   are not on the base branch, `.ddd/` stays uncommitted: say so, and warn
+   the developer not to commit it on this branch.
 
 ## Write-back
 
@@ -229,10 +247,13 @@ Detecting what the MCP can do, and caching it in config:
    defaults to the current branch; confirm it if that is not the usual main branch.
 4. Google Doc: probe the MCP (read, partial edit, comments) and record the
    results, e.g. `ddd config set capabilities.comments true`.
-5. Run the first sync. Everything is new, so there are no questions. Briefly
+5. Run the first sync (Google Doc: with `--doc-version`, so later syncs can
+   skip the fetch). Everything is new, so there are no questions. Briefly
    explain the optional markers (`[next]`, `[blocked]`, `[notes]`, `{#tag}`,
    `Done when:`) from [references/doc-format.md](references/doc-format.md).
-6. `ddd commit-state` (`.ddd/` is committed on the base branch).
+6. `ddd commit-state` (`.ddd/` is committed on the base branch). Off the base
+   branch it refuses: never switch branches over the developer's uncommitted
+   work to get there. Leave `.ddd/` uncommitted and tell them so.
 
 ## Rules
 

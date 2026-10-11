@@ -113,6 +113,7 @@
       "prompt": "ddd initialize",
       "expectations": [
         "Runs `ddd.py survey` and reads calc.py and test_calc.py before drafting",
+        "Records the test command exactly as it ran (`python -m unittest`), heeding any `warnings` from init",
         "Asks in one message whether the plan should be a Markdown file or a Google Doc, and nothing it could work out from the code",
         "After the answer 'markdown', writes docs/plan.md and validates the draft with `ddd.py parse`",
         "The plan lists add() under a Current features [notes] section, has planned features as H2 headings with - [ ] tasks, Done when: lines and {#tags}, and contains no [next] marker and no DDD Status section",
@@ -128,10 +129,36 @@
       "prompt": "ddd initialize - put the plan in a google doc",
       "expectations": [
         "Does not ask Markdown or Google Doc again (already answered)",
-        "Creates one Google Doc from the Markdown draft with conversion, titled '<project> plan' unless told otherwise",
-        "Reads the new doc back, runs `ddd.py parse` on the read-back and compares it with the draft; reports anything lost",
-        "Runs `ddd.py init --doc <the doc URL>` and records the probed capabilities",
+        "Puts each heading's tag and markers on their own line under the heading, never a '{' in a heading line",
+        "Creates exactly one Google Doc from the Markdown draft with conversion, titled '<project> plan' unless told otherwise",
+        "Reads the new doc back and runs `ddd.py parse <draft> --compare <read-back>`, passing a saved tool result as is instead of retyping it; reports anything lost",
+        "Never creates a second copy and never trashes a file",
+        "Runs `ddd.py init --doc <the doc URL>`, records the probed capabilities, and runs the first sync with `--doc-version <modifiedTime>`",
         "Creates no local docs/plan.md"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "initialize-off-base-branch",
+      "setup": "As eval 10, but on a branch `feature/x` with an uncommitted change to calc.py.",
+      "prompt": "ddd initialize markdown",
+      "expectations": [
+        "Says in its one question (or before drafting) that it is not on the base branch (main)",
+        "Does not switch branches, stash, commit or discard the developer's change",
+        "Does not tick any work that exists only on feature/x or in the working tree",
+        "Runs `ddd.py init --doc docs/plan.md --base main`; `commit-state` refuses and .ddd/ is left uncommitted",
+        "The report warns not to commit .ddd/ on feature/x and says the next run from main commits it"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "gdoc-sync-skips-unchanged-fetch",
+      "setup": "Project initialised with a Google Doc and synced with --doc-version; the doc has not changed since.",
+      "prompt": "ddd status",
+      "expectations": [
+        "Gets the doc's modified time from the metadata tool and runs `ddd.py diff --doc-version <modifiedTime>`",
+        "Sees fetch_skipped and does not download or retype the doc",
+        "Reports status from .ddd/ without asking any questions"
       ]
     }
   ]

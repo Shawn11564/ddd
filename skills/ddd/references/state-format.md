@@ -32,6 +32,7 @@
 {
   "version": 1,
   "doc_hash": "3f9c...",
+  "doc_version": "2026-10-11T05:49:09.880Z",
   "last_sync": "2026-10-10T14:03:00+00:00",
   "items": {
     "login": {
@@ -49,6 +50,11 @@
   }
 }
 ```
+
+`doc_version` is the Google Doc's version (modified time or revision id) at
+the last sync, recorded by `diff --doc-version` and `accept`.
+FILE arguments (`diff`, `parse`) take Markdown, a `.b64` file, or a connector's
+result saved as JSON (`{"content": "<base64 or text>"}`).
 
 `flags`: `changed-after-build`, `removed-from-doc`. `done_by`: `developer` (ticked
 in the doc), `merge`, `agent`. `derived_from` / `merged_into` record splits and
@@ -79,9 +85,9 @@ commits": `ddd log --item login`.
 |---|---|
 | `init --doc PATH\|URL [--base B] [--test CMD] [--force]` | Create `.ddd/` |
 | `info` | Config, state counts, flags, git branch and dirty files |
-| `parse FILE` | Parse a doc and print its items (no state needed; for debugging and validating drafts) |
-| `survey [--limit N]` | Facts about the project for Initialize mode: stack, manifests, tests, CI, docs, code markers, git (no state needed) |
-| `diff [FILE]` | Compare the doc with the last sync; saves a pending diff |
+| `parse FILE [--outline] [--compare OTHER]` | Parse a doc and print its items, one line per item, or what differs in OTHER (no state needed; for validating drafts and conversions) |
+| `survey [--limit N]` | Facts about the project for Initialize mode: stack, manifests, tests, CI, docs, code markers, git with `base_guess`/`on_base` (no state needed) |
+| `diff [FILE] [--doc-version V]` | Compare the doc with the last sync; saves a pending diff. Google Doc: without FILE, only reports whether V (modified time or revision) differs from the last synced version (`fetch_skipped` / `fetch_needed`) |
 | `accept [--match K=ID] [--new K] [--split ID=K,K] [--merge ID,ID=K] [--accept-proposed]` | Apply the pending diff |
 | `rank [--queued] [--limit N]` | Work candidates with signals; `--queued` for auto mode |
 | `items [--state S]` / `show ID` | List items / full record |

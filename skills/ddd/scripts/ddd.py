@@ -13,6 +13,8 @@ See ../references/state-format.md and ../references/matching.md.
 """
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import difflib
 import hashlib
@@ -161,6 +163,14 @@ def extract_title(raw):
     return (tags[0] if tags else None), markers, title
 
 
+def is_meta_line(line):
+    """A line holding only tags and markers, e.g. `{#auth} [next]`."""
+    text = line.strip()
+    if not (TAG_RE.search(text) or MARKER_RE.search(text)):
+        return False
+    return not MARKER_RE.sub("", TAG_RE.sub("", text)).strip()
+
+
 def is_status_title(text, status_title):
     _, _, title = extract_title(text)
     return norm(title).startswith(norm(status_title)) and bool(norm(status_title))
@@ -221,6 +231,7 @@ def parse_doc(text, status_title="DDD Status"):
     items = []
     heading_stack = []  # (level, item index)
     task_stack = []  # (indent, item index)
+    meta_target = None  # heading whose tag/marker line may follow (see doc-format.md)
     in_code = False
     warnings = []
 
@@ -277,7 +288,24 @@ def parse_doc(text, status_title="DDD Status"):
             idx = add("heading", level, hm.group(2), lineno, parent)
             heading_stack.append((level, idx))
             task_stack = []
+            meta_target = idx
             continue
+        if not line.strip():
+            continue
+        if meta_target is not None and is_meta_line(line):
+            # Google Docs' importer cuts a heading at its first "{", so the tag
+            # (and markers) can sit on their own line right under the heading.
+            tag, markers, _ = extract_title(line.strip())
+            heading = items[meta_target]
+            if tag and heading["tag"] and tag != heading["tag"]:
+                warnings.append("line %d: heading already has {#%s}; {#%s} is ignored"
+                                % (lineno, heading["tag"], tag))
+            elif tag:
+                heading["tag"] = tag
+            heading["markers"] = sorted(set(heading["markers"]) | set(markers))
+            meta_target = None
+            continue
+        meta_target = None
         cm = CHECK_RE.match(line)
         um = None if cm else UNICODE_CHECK_RE.match(line)
         if cm or um:
@@ -982,6 +1010,27 @@ def checkout(state, branch, create_from=None):
                 f.write(content)
 
 
+def test_command_warnings(root, cmd):
+    """Catch `gradlew test`-style commands: the program sits in the project root
+    but is not on PATH, so POSIX shells (Git Bash included) won't find it."""
+    if not cmd or not cmd.split():
+        return []
+    prog = cmd.split()[0]
+    if "/" in prog or "\\" in prog:
+        return []
+    exts = [""] + (os.environ.get("PATHEXT", "").lower().split(";") if os.name == "nt" else [])
+    root_abs = os.path.normcase(os.path.abspath(root))
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or d == "." or os.path.normcase(os.path.abspath(d)) == root_abs:
+            continue
+        if any(os.path.isfile(os.path.join(d, prog + e)) for e in exts):
+            return []
+    if any(os.path.isfile(os.path.join(root, prog + e)) for e in ("", ".sh", ".bat", ".cmd")):
+        return ["`%s` is in the project root but not on PATH; most shells need `./%s`. Record the "
+                "command exactly as you ran it." % (prog, prog)]
+    return []
+
+
 # --------------------------------------------------------------------------
 # commands
 
@@ -1018,7 +1067,7 @@ def cmd_init(args):
                            "`snapshot.md` is the doc as of the last sync, `log.jsonl` the audit trail.\n")
     st = State(root)
     st.log({"type": "init", "doc": cfg["doc"]})
-    emit({"ok": True, "root": root, "config": cfg})
+    emit({"ok": True, "root": root, "config": cfg, "warnings": test_command_warnings(root, args.test)})
 
 
 def cmd_info(args):
@@ -1035,9 +1084,51 @@ def cmd_info(args):
     emit(info)
 
 
+def read_doc_input(path):
+    """Doc text from a file: plain Markdown, a `.b64` file, or a connector's
+    result saved as JSON (`{"content": "<base64 or text>"}`, also wrapped in a
+    `[{"type": "text", "text": "..."}]` list), so a large result the host saved
+    to disk never has to be retyped."""
+    text = read_text(path)
+    if path.lower().endswith(".b64"):
+        return decode_b64(text, path)
+    stripped = text.lstrip()
+    if not stripped.startswith(("{", "[", '"')):
+        return text
+    try:
+        data = json.loads(stripped)
+    except ValueError:
+        return text
+    if isinstance(data, str):  # the result saved as a JSON string
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return data
+    if isinstance(data, list) and data and all(isinstance(x, dict) and "text" in x for x in data):
+        joined = "".join(x["text"] for x in data)
+        try:
+            data = json.loads(joined)
+        except ValueError:
+            return joined
+    if isinstance(data, dict) and isinstance(data.get("content"), str):
+        content = data["content"]
+        try:
+            return decode_b64(content, path)
+        except DddError:
+            return content
+    return text
+
+
+def decode_b64(value, path):
+    try:
+        return base64.b64decode("".join(value.split()), validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
+        raise DddError("%s is not valid base64 text" % path)
+
+
 def doc_text_for(state, path):
     if path:
-        return read_text(path)
+        return read_doc_input(path)
     cfg = state.config["doc"]
     if cfg.get("type") == "markdown" and cfg.get("path"):
         return read_text(os.path.join(state.root, cfg["path"]))
@@ -1045,14 +1136,66 @@ def doc_text_for(state, path):
                    ".ddd/tmp/doc.md, and pass that path")
 
 
+def outline(doc):
+    """One line per item: indent by depth, then title, tag, markers, checkbox."""
+    by_key = {it["key"]: it for it in doc["items"]}
+    lines = []
+    for it in doc["items"]:
+        depth, p = 0, it["parent"]
+        while p:
+            depth, p = depth + 1, by_key[p]["parent"]
+        box = "# " if it["checked"] is None else ("[x] " if it["checked"] else "[ ] ")
+        extra = (" {#%s}" % it["tag"] if it["tag"] else "") + "".join(" [%s]" % m for m in it["markers"])
+        if it["acceptance"]:
+            extra += " (done when: %d)" % len(it["acceptance"])
+        lines.append("%s%s%s%s" % ("  " * depth, box, it["title"], extra))
+    return lines
+
+
+def compare_docs(a, b):
+    """Align two parses by title and report what differs: what a conversion lost."""
+    fields = ("kind", "level", "tag", "markers", "checked", "acceptance")
+    ta = [it["title_norm"] for it in a["items"]]
+    tb = [it["title_norm"] for it in b["items"]]
+    diffs, only_a, only_b = [], [], []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ta, tb, autojunk=False).get_opcodes():
+        if op == "equal":
+            for x, y in zip(a["items"][i1:i2], b["items"][j1:j2]):
+                changed = {f: [x[f], y[f]] for f in fields if x[f] != y[f]}
+                if changed:
+                    diffs.append(dict({"title": x["title"]}, **changed))
+        else:
+            only_a += [it["title"] for it in a["items"][i1:i2]]
+            only_b += [it["title"] for it in b["items"][j1:j2]]
+    return {"same": not (diffs or only_a or only_b), "items": [len(ta), len(tb)],
+            "differences": diffs, "only_in_first": only_a, "only_in_second": only_b}
+
+
 def cmd_parse(args):
     st = State(args.root) if args.root else None
-    text = read_text(args.file)
-    emit(parse_doc(text, st.status_title() if st else "DDD Status"))
+    title = st.status_title() if st else "DDD Status"
+    doc = parse_doc(read_doc_input(args.file), title)
+    if args.compare:
+        other = parse_doc(read_doc_input(args.compare), title)
+        emit(dict(compare_docs(doc, other), warnings=[doc["warnings"], other["warnings"]]))
+    elif args.outline:
+        emit({"items": len(doc["items"]), "warnings": doc["warnings"], "outline": outline(doc)})
+    else:
+        emit(doc)
 
 
 def cmd_diff(args):
     st = load_state(args)
+    version = args.doc_version
+    if version and not args.file and st.config["doc"].get("type") == "gdoc":
+        # Cheap check before fetching a Google Doc: same version, same text.
+        pending = load_json(st.pending_path)
+        open_diff = bool(pending) and pending.get("doc_hash") != st.data.get("doc_hash")
+        unchanged = version == st.data.get("doc_version") and not open_diff
+        emit({"fetch_skipped": unchanged, "fetch_needed": not unchanged, "doc_unchanged": unchanged,
+              "needs_input": False, "doc_version": version,
+              "previous_doc_version": st.data.get("doc_version"), "doc_hash": st.data.get("doc_hash")})
+        return
     text = doc_text_for(st, args.file)
     doc = parse_doc(text, st.status_title())
     result = compute_diff(st.items, doc)
@@ -1062,7 +1205,10 @@ def cmd_diff(args):
     report["doc_unchanged"] = doc["hash"] == st.data.get("doc_hash")
     report["has_status_section"] = doc["has_status_section"]
     os.makedirs(st.tmp_dir, exist_ok=True)
-    save_json(st.pending_path, {"text": text, "doc_hash": doc["hash"]})
+    save_json(st.pending_path, {"text": text, "doc_hash": doc["hash"], "doc_version": version})
+    if version and report["doc_unchanged"]:
+        st.data["doc_version"] = version  # nothing to accept; remember the version now
+        st.save()
     emit(report)
 
 
@@ -1101,6 +1247,9 @@ def cmd_accept(args):
         raise DddError("uncertain matches need a decision: pass --match KEY=ID to confirm, --new KEY to "
                        "reject, or --accept-proposed", code=2, proposed=unresolved)
     key_to_id = apply_diff(st, doc, result, text, splits=splits, merges=merges)
+    if pending.get("doc_version"):
+        st.data["doc_version"] = pending["doc_version"]
+        st.save()
     os.remove(st.pending_path)
     emit({"ok": True, "doc_hash": doc["hash"], "summary": report["summary"],
           "ids": key_to_id, "conflicts": report["conflicts"]})
@@ -1332,8 +1481,9 @@ def cmd_commit_state(args):
     st = load_state(args)
     base = base_branch(st)
     if current_branch(st) != base:
-        raise DddError("ddd state is committed only on the base branch (%s); you are on %s"
-                       % (base, current_branch(st)))
+        raise DddError("ddd state is committed only on the base branch (%s); you are on %s. "
+                       "Leave .ddd/ uncommitted here (never `git add` it on this branch) and run "
+                       "commit-state after switching to %s" % (base, current_branch(st), base))
     git(st, "add", "--", STATE_DIR)
     code, out = git(st, "diff", "--cached", "--name-only", "--", STATE_DIR)
     if not out.strip():
@@ -1365,7 +1515,10 @@ def cmd_config(args):
     node[parts[-1]] = value
     st.save_config()
     st.log({"type": "config", "key": args.key, "value": value})
-    emit({"ok": True, "key": args.key, "value": value})
+    warnings = []
+    if args.key == "test_command" and isinstance(value, str):
+        warnings = test_command_warnings(st.root, value)
+    emit({"ok": True, "key": args.key, "value": value, "warnings": warnings})
 
 
 def cmd_log(args):
@@ -1446,6 +1599,13 @@ def survey_git(root):
         info["recent"] = recent.splitlines()
         _, unmerged = git(root, "branch", "--no-merged", "HEAD", "--format=%(refname:short)", check=False)
         info["unmerged_branches"] = [b for b in unmerged.splitlines() if b.strip()]
+    code, head = git(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    guess = head.split("/", 1)[1] if code == 0 and "/" in head else None
+    if not guess:
+        _, local = git(root, "branch", "--format=%(refname:short)", check=False)
+        guess = next((b for b in ("main", "master", "trunk", "develop") if b in local.split()), None)
+    info["base_guess"] = guess
+    info["on_base"] = guess is not None and info["branch"] == guess
     _, status = git(root, "status", "--porcelain", check=False)
     info["dirty_files"] = len([l for l in status.splitlines() if l.strip()])
     return info
@@ -1518,7 +1678,9 @@ def build_parser():
     s.set_defaults(func=cmd_info)
 
     s = sub.add_parser("parse", help="parse a doc and print its items (no state needed)")
-    s.add_argument("file")
+    s.add_argument("file", help="Markdown, a .b64 file, or a saved connector result (JSON)")
+    s.add_argument("--outline", action="store_true", help="one line per item instead of full JSON")
+    s.add_argument("--compare", metavar="OTHER", help="report what differs in OTHER (e.g. a read-back)")
     s.set_defaults(func=cmd_parse)
 
     s = sub.add_parser("survey", help="facts about the project for drafting a plan (no state needed)")
@@ -1526,7 +1688,10 @@ def build_parser():
     s.set_defaults(func=cmd_survey)
 
     s = sub.add_parser("diff", help="compare the doc with the last sync")
-    s.add_argument("file", nargs="?", help="doc text (required for Google Docs)")
+    s.add_argument("file", nargs="?", help="doc text (required for Google Docs): Markdown, .b64, or a "
+                   "saved connector result")
+    s.add_argument("--doc-version", help="the doc's modified time or revision id; without FILE, "
+                   "reports whether a fetch is needed")
     s.set_defaults(func=cmd_diff)
 
     s = sub.add_parser("accept", help="apply the pending diff")

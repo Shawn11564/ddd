@@ -34,6 +34,22 @@ Tags are optional. Untagged items are matched by their text, their parent and
 their position (see [matching.md](matching.md)). Tag the items you expect to
 rework heavily. Adding a tag later is safe: the agent adopts it as the item's id.
 
+A heading's tag and markers can also go on their own line directly under it:
+
+```markdown
+## Finish Clash
+
+{#clash} [next]
+
+Why it matters...
+```
+
+Use this form in Google Docs. Google cuts a heading at its first `{` when it
+imports Markdown, losing the tag and everything after it, but keeps a tag line
+(it exports it escaped, `{\#clash} \[next\]`, which the agent reads the same).
+The line must be the first one after the heading, holding nothing but tags and
+markers; anywhere else it is ordinary description text.
+
 ## What you can do freely
 
 - Reword, reorder, move items between sections, change heading levels, turn a

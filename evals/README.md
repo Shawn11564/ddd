@@ -38,3 +38,13 @@ fix the matcher until the scenario passes.
 
 Run the behaviour evals before each release, and whenever `SKILL.md` changes
 meaningfully.
+
+## claude_code_commands.py: mode commands in a real Claude Code
+
+`python evals/claude_code_commands.py` starts the `claude` CLI headless (it must
+be installed and logged in), reads only its startup event and checks that every
+file in `commands/` is registered as `/ddd:<mode>`, both when the repo is loaded
+as a plugin and when the commands are installed under `.claude/commands/ddd/`.
+It stops Claude Code before any model call. Run it after changing `commands/`
+or the installers; `tests/test_skill.py` (`ModeCommands`) covers the files and
+installers without the CLI.
