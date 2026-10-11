@@ -1,0 +1,4 @@
+{"description": "Editing a feature's description and queueing it is the same item, edited and queued.",
+ "matched": {"Dark mode": "dark-mode"},
+ "changes": {"Dark mode": ["edited", "queued"]},
+ "new": [], "removed": [], "ask": []}

@@ -1,0 +1,2 @@
+{"description": "The agent-owned status section never produces items and does not change the doc hash.",
+ "no_changes": true, "same_hash": true, "new": [], "removed": [], "ask": []}

@@ -1,0 +1,4 @@
+{"description": "Turning a feature heading into a checkbox under another heading keeps its identity.",
+ "matched": {"Dark mode": "dark-mode"},
+ "changes": {"Dark mode": ["moved"]},
+ "new": ["Later"], "removed": [], "ask": []}

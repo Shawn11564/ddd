@@ -1,0 +1,8 @@
+{
+  "name": "ddd",
+  "version": "0.1.0",
+  "description": "Document-Driven Development: build from a planning doc (Google Doc or Markdown) that you keep rewriting; the agent tracks what changed, offers what to build next or builds queued items on per-item branches, and reports status back into the doc.",
+  "author": { "name": "Shawn11564" },
+  "license": "MIT",
+  "keywords": ["planning", "google-docs", "markdown", "workflow", "autonomous", "skills"]
+}

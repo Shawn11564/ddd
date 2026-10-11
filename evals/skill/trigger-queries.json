@@ -1,0 +1,22 @@
+[
+  {"query": "ddd", "should_trigger": true},
+  {"query": "ddd auto 2", "should_trigger": true},
+  {"query": "what should I work on next? it's all in my planning doc", "should_trigger": true},
+  {"query": "I updated the plan doc, check what changed and pick something up", "should_trigger": true},
+  {"query": "here's my roadmap google doc https://docs.google.com/document/d/1AbC/edit - build the next items from it", "should_trigger": true},
+  {"query": "sync with the spec doc and tell me where we are", "should_trigger": true},
+  {"query": "work from docs/plan.md and implement whatever is marked [next]", "should_trigger": true},
+  {"query": "what's the status of the items in the plan? anything waiting on review?", "should_trigger": true},
+  {"query": "set up doc-driven development for this repo", "should_trigger": true},
+  {"query": "keep building features from my plan doc until you hit a question", "should_trigger": true},
+  {"query": "explain domain-driven design aggregates", "should_trigger": false},
+  {"query": "write documentation for this module", "should_trigger": false},
+  {"query": "summarize this google doc for me", "should_trigger": false},
+  {"query": "create a project plan document for a mobile app", "should_trigger": false},
+  {"query": "fix the failing test in test_calc.py", "should_trigger": false},
+  {"query": "convert README.md to a Word document", "should_trigger": false},
+  {"query": "what does DDD stand for in finance?", "should_trigger": false},
+  {"query": "generate API docs from these docstrings", "should_trigger": false},
+  {"query": "edit my google doc to fix the typos", "should_trigger": false},
+  {"query": "make a todo list for tomorrow", "should_trigger": false}
+]

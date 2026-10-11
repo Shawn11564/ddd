@@ -1,0 +1,4 @@
+{"description": "A box the developer ticks marks the item done.",
+ "changes": {"Login form with email and password fields": ["checked"]},
+ "new": [], "removed": [], "ask": [],
+ "after_accept": {"states": {"Login form with email and password fields": "done"}}}

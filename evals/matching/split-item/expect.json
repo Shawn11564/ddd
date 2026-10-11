@@ -1,0 +1,6 @@
+{"description": "Splitting a feature in two keeps the closest half matched and flags the other as a possible split.",
+ "matched": {"Export reports as CSV": "export-reports"},
+ "new": ["Export reports as PDF"],
+ "removed": ["write-tests-2"],
+ "splits": [{"from": "export-reports", "label": "Export reports as PDF"}],
+ "no_hint_for": ["write-tests-2"]}

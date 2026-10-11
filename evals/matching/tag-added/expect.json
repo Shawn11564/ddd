@@ -1,0 +1,5 @@
+{"description": "Adding {#auth} to an untagged heading adopts the tag as the id and keeps the old id as an alias.",
+ "matched": {"Sign-in": "sign-in"},
+ "changes": {"Sign-in": ["retagged"]},
+ "new": [], "removed": [], "ask": [],
+ "after_accept": {"ids": {"Sign-in": "auth"}, "aliases": {"auth": ["sign-in"]}}}

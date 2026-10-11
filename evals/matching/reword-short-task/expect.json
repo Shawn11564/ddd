@@ -1,0 +1,2 @@
+{"description": "A heavily reworded task with no body is not matched silently; the agent asks.",
+ "ask": [{"label": "Keep users signed in for 30 days (remember me)", "id": "remember-me-option-that-keeps"}]}

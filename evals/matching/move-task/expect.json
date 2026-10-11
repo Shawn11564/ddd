@@ -1,0 +1,4 @@
+{"description": "A task moved under a new heading keeps its identity and is reported as moved.",
+ "matched": {"Pasword reset by email": "pasword-reset-by-email"},
+ "changes": {"Pasword reset by email": ["moved"]},
+ "new": ["Account recovery"], "removed": [], "ask": []}

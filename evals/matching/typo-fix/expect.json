@@ -1,0 +1,4 @@
+{"description": "A typo fix in a task title is the same item, renamed.",
+ "matched": {"Password reset by email": "pasword-reset-by-email"},
+ "changes": {"Password reset by email": ["renamed"]},
+ "new": [], "removed": [], "ask": []}

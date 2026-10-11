@@ -1,0 +1,17 @@
+{
+  "name": "ddd",
+  "owner": {
+    "name": "Shawn11564"
+  },
+  "metadata": {
+    "description": "Document-Driven Development: an agent skill that builds from a planning doc you keep rewriting."
+  },
+  "plugins": [
+    {
+      "name": "ddd",
+      "source": "./",
+      "description": "Document-Driven Development: build from a planning doc you keep rewriting.",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{"description": "Merging two tasks matches the merged task to one of them (confirmed by the developer) and flags the other as a possible merge.",
+ "removed": ["remember-me-option-that-keeps"],
+ "ask": [{"label": "Login form with email and password fields, plus a remember-me option for 30 days", "id": "login-form-with-email-and"},
+         {"label": "Login form with email and password fields, plus a remember-me option for 30 days", "id": "remember-me-option-that-keeps"}]}
