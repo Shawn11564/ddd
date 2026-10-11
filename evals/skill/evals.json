@@ -34,7 +34,7 @@
       "setup": "After eval 1.",
       "prompt": "ddd auto",
       "expectations": [
-        "Builds subtract on branch ddd/subtract and multiply on its own ddd/ branch, each from main",
+        "Builds subtract on branch ddd/subtract from main and multiply on its own ddd/ branch: from main, or stacked on ddd/subtract with `start --from` and said so (both edit calc.py)",
         "Every item commit carries a `DDD-Item: <id>` trailer and none touches .ddd/",
         "Adds tests for the Done when criteria and runs the test command before `finish --tests-passed`",
         "Both items end in awaiting-review, not done",
@@ -159,6 +159,20 @@
         "Gets the doc's modified time from the metadata tool and runs `ddd.py diff --doc-version <modifiedTime>`",
         "Sees fetch_skipped and does not download or retype the doc",
         "Reports status from .ddd/ without asking any questions"
+      ]
+    },
+    {
+      "id": 14,
+      "name": "gdoc-status-write-docs-connector",
+      "setup": "Project initialised with a scratch Google Doc (never a real plan) and synced; the Google Docs connector (read_doc, update_doc) is connected; item login is awaiting review.",
+      "prompt": "ddd status",
+      "expectations": [
+        "Records capabilities.targeted_edit as the Docs edit tool",
+        "Reads the structure with read_doc and passes it to `ddd.py status-block --gdoc-read`: a host-saved result as is, an inline one trimmed to the fields backends.md lists, never paraphrased",
+        "Sends the printed requests and writeControl in one update_doc call, never without writeControl",
+        "Reads again and runs `ddd.py status-block --gdoc-check`, which reports ok",
+        "In the doc: a DDD Status heading at the end with login under Awaiting review as a bullet; every other paragraph unchanged",
+        "Running it again replaces the section instead of adding a second one"
       ]
     }
   ]

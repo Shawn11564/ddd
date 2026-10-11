@@ -25,6 +25,7 @@
 | `auto.on_blocker` | `stop` | `stop` or `skip` in auto mode |
 | `auto.max_items` | null | Default item limit for auto mode |
 | `capabilities.read` / `.targeted_edit` / `.comments` | null | Cached MCP capabilities (Google Docs) |
+| `doc.tab` | none | Google Doc tab to write the status section to, from the URL's `?tab=` |
 
 ## items.json
 
@@ -97,7 +98,8 @@ commits": `ddd log --item login`.
 | `finish ID --tests-passed SUMMARY [--note] [--stay]` | Mark awaiting review, return to base |
 | `checkout BRANCH` | Switch branches, keeping `.ddd/` |
 | `sync-git` | Mark merged items done |
-| `status-block [--write PATH] [--expect-hash H]` | Render or write the status section |
+| `status-block [--write PATH] [--expect-hash H]` | Render or write the status section (Markdown doc) |
+| `status-block --gdoc-read READ [--tab T]` / `--gdoc-check READ` | Google Doc: the guarded `batchUpdate` requests that replace the status section, built from a `read_doc` result (saved by the host, or trimmed as in backends.md); then check a fresh read against what was written (saved in `.ddd/tmp/gdoc-status.json`) |
 | `commit-state [-m MSG]` | Commit `.ddd/` on the base branch |
 | `config get [KEY]` / `config set KEY VALUE` | Dotted keys; VALUE parsed as JSON when possible |
 | `log [--item ID] [--limit N]` | Audit trail |

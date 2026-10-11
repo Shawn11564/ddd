@@ -63,7 +63,11 @@ file. Keep it as low as you can:
    the doc is unchanged since the last sync. Pass the same `--doc-version` with
    the file when you do fetch, so the version is recorded. Comments and your
    own status writes also change `modifiedTime`; the next sync then fetches
-   once, sees no change, and records the new version.
+   once, sees no change, and records the new version. `modifiedTime` trails
+   edits by a minute or more (seen on a live doc), so a sync right after an
+   edit can skip it; the next sync catches it, and writes stay safe because
+   they are revision-guarded. If the developer says they just edited the doc,
+   fetch anyway.
 2. **Use a saved result as is.** When the host saved a large tool result to a
    file, pass that file: `ddd diff <file>` and `ddd parse <file>` read a saved
    JSON result (`{"content": ...}`, base64 or text, also inside a
@@ -97,17 +101,60 @@ delete.
 
 ### Writing the status section: partial edits only
 
-`capabilities.targeted_edit` is true only if a tool can change part of a
-document: replace a text range, find-and-replace, Docs `batchUpdate`, or insert
-at the end. Then:
+`capabilities.targeted_edit` is set only if a tool can change part of a
+document. The Google Docs connector can: `read_doc` returns the document's
+structure (`documents.get` JSON, with positions and a `revisionId`) and
+`update_doc` applies Docs `batchUpdate` requests. The Google Drive connector
+can't: its `update_file` only renames or moves a file. Record the tool, e.g.
+`ddd config set capabilities.targeted_edit "update_doc"`.
 
-1. Re-read the doc, save it to `.ddd/tmp/doc.md`, and run `ddd diff .ddd/tmp/doc.md`.
-   If `doc_unchanged` is false, finish the sync (accept, with questions if
-   needed) before writing.
-2. `ddd status-block` gives the section text.
-3. Replace the existing section, from the `DDD Status` heading up to the next
-   heading of the same or higher level (or the end of the doc). If there is no
-   section yet, append it at the end.
+With the Google Docs connector:
+
+1. Finish the sync first: the diff must report `doc_unchanged` (accept, with
+   questions if needed).
+2. Read the structure with `read_doc` (no comments). If the host saved the
+   result to a file, pass that file as is. If it came back inline (a small
+   doc), write `.ddd/tmp/read.json` yourself with only the fields the script
+   reads, copied exactly: `documentId`, `revisionId`, and per tab
+   `tabProperties.tabId` and `documentTab.body.content`. Keep every `content`
+   element, in order. A section break or table needs only `startIndex` and
+   `endIndex`; a paragraph needs `startIndex`, `endIndex`,
+   `paragraphStyle.namedStyleType`, `bullet` (`{}` when present) and, per
+   element, the `textRun`'s `content`, `textStyle` and any
+   `suggestedInsertionIds`/`suggestedDeletionIds`. Drop `lists`,
+   `namedStyles`, `documentStyle` and the other style fields: they are most of
+   the size. Never paraphrase text or recompute an index.
+3. `ddd status-block --gdoc-read <saved read>` prints `requests` and
+   `writeControl` (`requiredRevisionId` from that read). They replace the
+   section, from the `DDD Status` heading up to the next heading of the same
+   or higher level (or the end of the doc), or append it at the end. They keep
+   the section's last paragraph break and restyle only the new paragraphs, so
+   the developer's text and styles are untouched. The tab is `--tab`, else
+   the doc URL's `?tab=`, else the first tab (a warning says so when there are
+   several).
+4. Send `requests` and `writeControl` in one `update_doc` call, with the
+   document id. Never drop `writeControl`: if the call is rejected because the
+   revision changed, the developer is editing; read again and rebuild, or skip
+   the write this run.
+5. Read again and run `ddd status-block --gdoc-check <saved read>`. `ok`
+   logs the write; differences mean the edit didn't land as built, so report
+   them and don't retry blindly.
+
+Exit 3 from `--gdoc-read` means the section has pending suggestions; ask the
+developer to accept or reject them first. The write changes the doc's
+`modifiedTime` (after the lag above), so a later sync fetches once and
+records the new version.
+
+The requests follow the Docs API rules (positions in UTF-16 units, a
+paragraph's style on its trailing newline, the body's last newline kept). Their
+arithmetic is covered by `GdocStatusTests` in `tests/test_ddd.py`, against a
+model of the API whose reads have the trimmed shape from step 2. One live run
+(2026-10-11) confirmed append, replace before a developer heading, emoji
+positions and the stale-revision rejection against Google itself; it also
+showed the connector's read shape, `{"content": {...}}`, now in that test.
+
+Other MCPs: use a range replace or find-and-replace on the same section, and
+re-read to check the result.
 
 Many Drive connectors only offer "update file", which replaces the entire
 content. **Do not use that on the developer's doc.** It drops formatting,
@@ -134,5 +181,6 @@ comments' anchors and suggestions, and anything typed since you read it. Set
 ### Without partial edits and without comments
 
 The doc is read-only to you. Status lives in `.ddd/` and in your chat report.
-Tell the developer once, and suggest an MCP with comment support if they want
-status in the doc.
+Tell the developer once, and suggest connecting the Google Docs connector (or
+another MCP that edits part of a doc or posts comments) if they want status in
+the doc.

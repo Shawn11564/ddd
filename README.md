@@ -106,10 +106,13 @@ unsure.
 ### Google Docs
 
 The skill reads your doc through whatever Google Docs/Drive MCP your agent
-has. It only writes the status section if that MCP can edit part of a
-document. It never replaces the whole doc, which would wipe your formatting
-and race your edits. Without partial edits it uses comments; without comments
-it keeps status in `.ddd/` and its chat report.
+has. It only writes the status section if a tool can edit part of a document:
+connect the **Google Docs** connector for that (Google Drive alone can read
+and create docs but not edit them). It never replaces the whole doc, which
+would wipe your formatting and race your edits. Each write is guarded by the
+doc's revision, so it is refused rather than misplaced if you are typing at
+the same moment. Without partial edits it uses comments; without comments it
+keeps status in `.ddd/` and its chat report.
 
 Syncing checks the doc's modified time first and fetches the text only when it
 changed, because fetching a Google Doc costs tokens in proportion to its size.

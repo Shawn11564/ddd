@@ -908,6 +908,245 @@ def replace_status(text, block, status_title):
 
 
 # --------------------------------------------------------------------------
+# status section in a Google Doc: Docs API batchUpdate requests built from a
+# saved documents.get (read_doc) result. Indexes are UTF-16 code units, and a
+# paragraph's style lives on its trailing newline, so the section's last
+# newline is kept and reused: no developer paragraph is ever merged or
+# restyled. Guarded by tests/test_ddd.py GdocStatusTests.
+
+GDOC_HEADING_LEVELS = dict([("TITLE", 0), ("SUBTITLE", 0)] +
+                           [("HEADING_%d" % n, n) for n in range(1, 7)])
+GDOC_TEXT_FIELDS = ("bold,italic,underline,strikethrough,smallCaps,backgroundColor,"
+                    "foregroundColor,fontSize,weightedFontFamily,baselineOffset,link")
+GDOC_PARA_FIELDS = "namedStyleType,alignment,indentStart,indentEnd,indentFirstLine,spaceAbove,spaceBelow"
+GDOC_CODE_FONT = "Roboto Mono"
+GDOC_BULLETS = "BULLET_DISC_CIRCLE_SQUARE"
+
+
+def u16(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def load_gdoc_json(path):
+    """The documents.get JSON inside a saved read_doc result: the raw JSON, a
+    `{"content": {...}}` wrapper (the Google Docs connector's shape), the same
+    with the JSON as a string, or a `[{"type": "text", ...}]` list."""
+    try:
+        data = json.loads(read_text(path))
+    except ValueError as e:
+        raise DddError("%s is not JSON (%s)" % (path, e))
+    for _ in range(5):
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except ValueError:
+                break
+        elif isinstance(data, list):
+            texts = [b.get("text") for b in data if isinstance(b, dict) and isinstance(b.get("text"), str)]
+            if not texts:
+                break
+            data = "".join(texts)
+        elif isinstance(data, dict) and "tabs" not in data and "body" not in data \
+                and isinstance(data.get("content"), (str, list, dict)):
+            data = data["content"]
+        else:
+            break
+    if not isinstance(data, dict) or not ("tabs" in data or "body" in data):
+        raise DddError("%s is not a Google Docs read (documents.get JSON with 'tabs' or 'body')" % path)
+    return data
+
+
+def gdoc_tab(doc, tab_id=None):
+    """(tab id, body content, warnings) of the tab to write: `tab_id`, else the first."""
+    if "tabs" not in doc:
+        if tab_id:
+            raise DddError("the read has no tabs, so there is no tab %s" % tab_id)
+        return None, doc["body"]["content"], []
+    flat = []
+
+    def visit(tabs):
+        for t in tabs:
+            flat.append((t["tabProperties"]["tabId"], t["documentTab"]["body"]["content"]))
+            visit(t.get("childTabs", []))
+    visit(doc["tabs"])
+    if not flat:
+        raise DddError("the read has no tabs")
+    if tab_id:
+        for tid, content in flat:
+            if tid == tab_id:
+                return tid, content, []
+        raise DddError("no tab %s in the doc; its tabs: %s" % (tab_id, ", ".join(t for t, _ in flat)))
+    warnings = []
+    if len(flat) > 1:
+        warnings.append("the doc has %d tabs; writing to the first (%s). Pass --tab to choose."
+                        % (len(flat), flat[0][0]))
+    return flat[0][0], flat[0][1], warnings
+
+
+def gdoc_paragraphs(content):
+    out = []
+    for el in content:
+        p = el.get("paragraph")
+        if p is None:
+            continue
+        runs = [e["textRun"] for e in p.get("elements", []) if "textRun" in e]
+        out.append({
+            "start": el.get("startIndex", 0), "end": el["endIndex"],
+            "text": "".join(r.get("content", "") for r in runs).rstrip("\n"),
+            "style": p.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT"),
+            "bullet": "bullet" in p,
+            "suggested": any(r.get("suggestedInsertionIds") or r.get("suggestedDeletionIds") for r in runs),
+            "text_style": runs[0].get("textStyle", {}) if runs else {},
+        })
+    return out
+
+
+def gdoc_status_span(paras, status_title):
+    """(first, last) paragraph indexes of the status section, or None. Mirrors
+    status_span(): a heading reading the title, up to the next heading of the
+    same or higher level; a bare line reading the title runs to the end."""
+    start = level = None
+    for i, p in enumerate(paras):
+        text = unescape(p["text"]).strip()
+        lvl = GDOC_HEADING_LEVELS.get(p["style"])
+        if start is None:
+            if lvl and is_status_title(text, status_title):
+                start, level = i, lvl
+            elif lvl is None and text and is_status_title(text, status_title) \
+                    and norm(extract_title(text)[2]) == norm(status_title):
+                start, level = i, 0
+        elif level and lvl is not None and lvl <= level:
+            return start, i - 1
+    if start is None:
+        return None
+    return start, len(paras) - 1
+
+
+def status_paragraphs(block, level=None):
+    """The rendered status block (Markdown) as Docs paragraphs."""
+    specs = []
+    for line in split_lines(block):
+        if not line.strip():
+            continue
+        hm = HEADING_RE.match(line)
+        if hm:
+            specs.append({"text": hm.group(2), "style": "HEADING_%d" % (level or len(hm.group(1))),
+                          "bullet": False, "whole": None, "code": []})
+            continue
+        bullet = line.startswith("- ")
+        body = line[2:] if bullet else line
+        whole = None
+        if len(body) > 4 and body.startswith("**") and body.endswith("**"):
+            body, whole = body[2:-2], "bold"
+        elif len(body) > 2 and body.startswith("_") and body.endswith("_"):
+            body, whole = body[1:-1], "italic"
+        text, code = "", []
+        for k, part in enumerate(body.split("`")):
+            if k % 2 and part:
+                code.append((u16(text), u16(text) + u16(part)))
+            text += part
+        specs.append({"text": text, "style": "NORMAL_TEXT", "bullet": bullet, "whole": whole, "code": code})
+    return specs
+
+
+def gdoc_status_requests(doc, block, status_title, tab_id=None):
+    """batchUpdate arguments that replace (or append) the status section."""
+    if not doc.get("revisionId"):
+        raise DddError("the read has no revisionId; read the doc again with the Docs tool")
+    tab, content, warnings = gdoc_tab(doc, tab_id)
+    paras = gdoc_paragraphs(content)
+    body_end = content[-1]["endIndex"]
+    span = gdoc_status_span(paras, status_title)
+
+    def loc(i):
+        return dict({"index": i}, **({"tabId": tab} if tab else {}))
+
+    def rng(a, b):
+        return dict({"startIndex": a, "endIndex": b}, **({"tabId": tab} if tab else {}))
+
+    requests = []
+    heading_style = {}
+    if span:
+        section = paras[span[0]: span[1] + 1]
+        if any(p["suggested"] for p in section):
+            raise DddError("the %s section in the doc has pending suggestions; ask the developer to accept "
+                           "or reject them, then write again" % status_title, code=3)
+        first, last = section[0], section[-1]
+        level = GDOC_HEADING_LEVELS.get(first["style"]) or None
+        heading_style = first["text_style"]
+        if last["end"] - 1 > first["start"]:  # keep the section's last newline
+            requests.append({"deleteContentRange": {"range": rng(first["start"], last["end"] - 1)}})
+        specs = status_paragraphs(block, level)
+        at = pos = first["start"]
+        text = "\n".join(s["text"] for s in specs)
+    else:
+        specs = status_paragraphs(block)
+        same = [p for p in paras if p["style"] == specs[0]["style"]]
+        heading_style = same[0]["text_style"] if same else {}
+        at = body_end - 1
+        pos = at + 1
+        text = "\n" + "\n".join(s["text"] for s in specs)
+    requests.append({"insertText": {"location": loc(at), "text": text}})
+
+    for s in specs:
+        s["start"] = pos
+        s["end"] = pos + u16(s["text"])  # its newline sits at `end`
+        pos = s["end"] + 1
+    whole = rng(specs[0]["start"], specs[-1]["end"])
+    requests.append({"deleteParagraphBullets": {"range": whole}})
+    for s in specs:
+        r = rng(s["start"], max(s["end"], s["start"] + 1))
+        requests.append({"updateParagraphStyle": {"range": r, "paragraphStyle": {"namedStyleType": s["style"]},
+                                                  "fields": GDOC_PARA_FIELDS}})
+    for s in specs:
+        if s["end"] == s["start"]:
+            continue
+        base = {k: v for k, v in heading_style.items() if k != "link"} if s["style"] != "NORMAL_TEXT" else {}
+        requests.append({"updateTextStyle": {"range": rng(s["start"], s["end"]), "textStyle": base,
+                                             "fields": GDOC_TEXT_FIELDS}})
+        if s["whole"]:
+            requests.append({"updateTextStyle": {"range": rng(s["start"], s["end"]),
+                                                 "textStyle": {s["whole"]: True}, "fields": s["whole"]}})
+        for a, b in s["code"]:
+            requests.append({"updateTextStyle": {"range": rng(s["start"] + a, s["start"] + b),
+                                                 "textStyle": {"weightedFontFamily": {"fontFamily": GDOC_CODE_FONT}},
+                                                 "fields": "weightedFontFamily"}})
+    i = 0
+    while i < len(specs):
+        if not specs[i]["bullet"]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(specs) and specs[j + 1]["bullet"]:
+            j += 1
+        requests.append({"createParagraphBullets": {"range": rng(specs[i]["start"], specs[j]["end"]),
+                                                    "bulletPreset": GDOC_BULLETS}})
+        i = j + 1
+    expected = [{"text": s["text"], "style": s["style"], "bullet": s["bullet"]} for s in specs]
+    return {"documentId": doc.get("documentId"), "tabId": tab, "requests": requests,
+            "writeControl": {"requiredRevisionId": doc["revisionId"]},
+            "replaced": bool(span), "expected": expected, "warnings": warnings}
+
+
+def gdoc_status_check(doc, expected, status_title, tab_id=None):
+    """Differences between the status section in a fresh read and what was written."""
+    tab, content, _ = gdoc_tab(doc, tab_id)
+    paras = gdoc_paragraphs(content)
+    span = gdoc_status_span(paras, status_title)
+    if not span:
+        return ["no %s section found" % status_title]
+    got = [{"text": p["text"], "style": p["style"], "bullet": p["bullet"]}
+           for p in paras[span[0]: span[1] + 1]]
+    diffs = []
+    for k, (e, g) in enumerate(zip(expected, got)):
+        if e != g:
+            diffs.append("paragraph %d: expected %s, found %s" % (k + 1, json.dumps(e), json.dumps(g)))
+    if len(got) != len(expected):
+        diffs.append("expected %d paragraphs, found %d" % (len(expected), len(got)))
+    return diffs
+
+
+# --------------------------------------------------------------------------
 # git
 
 def git(state_or_root, *argv, check=True):
@@ -1045,6 +1284,9 @@ def cmd_init(args):
     m = re.search(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)", doc)
     if m:
         cfg["doc"] = {"type": "gdoc", "url": doc, "id": m.group(1), "path": None}
+        tab = re.search(r"[?&#]tab=(t\.[A-Za-z0-9_-]+)", doc)
+        if tab:
+            cfg["doc"]["tab"] = tab.group(1)
     else:
         rel = os.path.relpath(os.path.abspath(os.path.join(root, doc)), root).replace("\\", "/")
         cfg["doc"] = {"type": "markdown", "path": rel, "url": None, "id": None}
@@ -1458,7 +1700,26 @@ def cmd_sync_git(args):
 
 def cmd_status_block(args):
     st = load_state(args)
+    saved = os.path.join(st.root, STATE_DIR, "tmp", "gdoc-status.json")
+    tab = args.tab or st.config["doc"].get("tab")
+    if args.gdoc_check:
+        written = load_json(saved)
+        if not written:
+            raise DddError("nothing to check: run `status-block --gdoc-read` and apply its requests first")
+        diffs = gdoc_status_check(load_gdoc_json(args.gdoc_check), written["expected"],
+                                  st.status_title(), written.get("tabId") or tab)
+        if diffs:
+            raise DddError("the status section doesn't match what was written", differences=diffs)
+        st.log({"type": "status-write", "doc": "gdoc", "tab": written.get("tabId")})
+        emit({"ok": True, "paragraphs": len(written["expected"])})
+        return
     block = render_status(st)
+    if args.gdoc_read:
+        out = gdoc_status_requests(load_gdoc_json(args.gdoc_read), block, st.status_title(), tab)
+        save_json(saved, {"tabId": out["tabId"], "expected": out["expected"]})
+        out["block"] = block
+        emit(out)
+        return
     if not args.write:
         emit({"block": block, "title": st.status_title()})
         return
@@ -1754,6 +2015,12 @@ def build_parser():
     s = sub.add_parser("status-block", help="render (or write) the agent-owned status section")
     s.add_argument("--write", metavar="PATH", help="local Markdown doc to update in place")
     s.add_argument("--expect-hash", help="doc hash the write is based on (default: last sync)")
+    s.add_argument("--gdoc-read", metavar="READ",
+                   help="Google Doc: a saved read_doc (documents.get) result; prints the guarded "
+                        "batchUpdate requests that replace or append the status section")
+    s.add_argument("--gdoc-check", metavar="READ",
+                   help="Google Doc: a read taken after applying those requests; checks the section")
+    s.add_argument("--tab", help="Google Doc tab id (default: the doc URL's ?tab=, else the first tab)")
     s.set_defaults(func=cmd_status_block)
 
     s = sub.add_parser("commit-state", help="commit .ddd/ on the base branch")

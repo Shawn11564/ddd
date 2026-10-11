@@ -263,6 +263,236 @@ class GoogleImportTests(unittest.TestCase):
         self.assertEqual(tags, {"fixes", "fix-sims", "fixed-thing", "clash", "clash-kits", "clash-cards"})
 
 
+class FakeDoc:
+    """A model of one Docs tab, enough to apply the requests status-block emits
+    and read the result back as documents.get JSON. It encodes the API rules the
+    requests rely on (UTF-16 indexes from 1, a paragraph's style on its newline,
+    a split paragraph's halves both keeping its style, the final newline
+    undeletable). It checks the arithmetic, not Google: the live check against
+    a real doc is eval 14 (gdoc-status-write-docs-connector) in evals/skill/evals.json.
+    """
+
+    def __init__(self, paras, tab="t.0", revision="rev-1"):
+        self.tab, self.revision = tab, revision
+        self.units, self.attrs = [], []
+        for p in paras:
+            text, style, bullet = (p + (False,))[:3] if isinstance(p, tuple) else (p, "NORMAL_TEXT", False)
+            for u in self.encode(text):
+                self.units.append(u)
+                self.attrs.append(None)
+            self.units.append("\n")
+            self.attrs.append({"style": style, "bullet": bullet, "suggested": False})
+
+    @staticmethod
+    def encode(text):
+        data = text.encode("utf-16-le")
+        return [data[i:i + 2] for i in range(0, len(data), 2)]
+
+    def paragraphs(self):
+        out, start, buf = [], 1, []
+        for i, (u, a) in enumerate(zip(self.units, self.attrs)):
+            if a is None:
+                buf.append(u)
+                continue
+            text = b"".join(buf).decode("utf-16-le")
+            out.append((start, i + 2, text, a))
+            start, buf = i + 2, []
+        return out
+
+    def body_end(self):
+        return len(self.units) + 1
+
+    def para_at(self, index):
+        for i in range(index - 1, len(self.units)):
+            if self.attrs[i] is not None:
+                return i
+        raise AssertionError("index %d is past the end" % index)
+
+    def check_tab(self, where):
+        assert where.get("tabId") == self.tab, where
+
+    def apply(self, args):
+        assert args["writeControl"]["requiredRevisionId"] == self.revision, "stale revision"
+        for req in args["requests"]:
+            (kind, body), = req.items()
+            getattr(self, kind)(body)
+        self.revision += "+"
+
+    def deleteContentRange(self, body):
+        r = body["range"]
+        self.check_tab(r)
+        a, b = r["startIndex"], r["endIndex"]
+        assert 1 <= a < b <= len(self.units), "invalid deletion range %d-%d" % (a, b)
+        del self.units[a - 1:b - 1]
+        del self.attrs[a - 1:b - 1]
+
+    def insertText(self, body):
+        loc = body["location"]
+        self.check_tab(loc)
+        at = loc["index"]
+        assert 1 <= at <= len(self.units), "insert outside the body"
+        style = dict(self.attrs[self.para_at(at)])
+        new_units, new_attrs = [], []
+        for ch in body["text"]:
+            for u in ([ch] if ch == "\n" else self.encode(ch)):
+                new_units.append(u)
+                new_attrs.append(dict(style) if ch == "\n" else None)
+        self.units[at - 1:at - 1] = new_units
+        self.attrs[at - 1:at - 1] = new_attrs
+
+    def paras_in(self, r):
+        self.check_tab(r)
+        a, b = r["startIndex"], r["endIndex"]
+        assert 1 <= a < b <= self.body_end(), "range %d-%d outside the body" % (a, b)
+        return [self.attrs[i] for i in range(self.para_at(a), self.para_at(b - 1) + 1)
+                if self.attrs[i] is not None]
+
+    def updateParagraphStyle(self, body):
+        for a in self.paras_in(body["range"]):
+            a["style"] = body["paragraphStyle"].get("namedStyleType", "NORMAL_TEXT")
+
+    def createParagraphBullets(self, body):
+        for a in self.paras_in(body["range"]):
+            a["bullet"] = True
+
+    def deleteParagraphBullets(self, body):
+        for a in self.paras_in(body["range"]):
+            a["bullet"] = False
+
+    def updateTextStyle(self, body):
+        r = body["range"]
+        self.check_tab(r)
+        assert 1 <= r["startIndex"] < r["endIndex"] <= self.body_end() - 1, r
+
+    def read(self):
+        content = [{"endIndex": 1, "sectionBreak": {}}]
+        for start, end, text, a in self.paragraphs():
+            run = {"content": text + "\n", "textStyle": {"bold": True} if a["style"] != "NORMAL_TEXT" else {}}
+            if a.get("suggested"):
+                run["suggestedInsertionIds"] = ["s1"]
+            para = {"elements": [{"startIndex": start, "endIndex": end, "textRun": run}],
+                    "paragraphStyle": {"namedStyleType": a["style"]}}
+            if a["bullet"]:
+                para["bullet"] = {"listId": "l1"}
+            content.append({"startIndex": start, "endIndex": end, "paragraph": para})
+        return {"documentId": "doc1", "revisionId": self.revision,
+                "tabs": [{"tabProperties": {"tabId": self.tab}, "documentTab": {"body": {"content": content}}}]}
+
+    def texts(self):
+        return [(p[2], p[3]["style"], p[3]["bullet"]) for p in self.paragraphs()]
+
+
+class GdocStatusTests(unittest.TestCase):
+    """status-block --gdoc-read: the Docs requests that replace the status section."""
+    BLOCK = ("## DDD Status\n\n_Maintained by the ddd agent. Last sync: now._\n\n"
+             "**Awaiting review**\n- Login form {#login} - branch `ddd/login`\n- Logout \U0001F642\n\n"
+             "**Blocked / questions**\n- Export - question: CSV only?\n")
+    DEV = [("Plan", "TITLE"), ("Sign-in \U0001F44D\U0001F3FD", "HEADING_2"), ("Login form", "NORMAL_TEXT", True),
+           ("Logout", "NORMAL_TEXT", True), ("Dark mode", "HEADING_2"), "Theme toggle."]
+
+    def write_section(self, fake, block=None, tab=None):
+        args = ddd.gdoc_status_requests(fake.read(), block or self.BLOCK, "DDD Status", tab)
+        fake.apply(args)
+        self.assertEqual(ddd.gdoc_status_check(fake.read(), args["expected"], "DDD Status", tab), [])
+        return args
+
+    def section(self, fake):
+        texts = fake.texts()
+        start = [t[0] for t in texts].index("DDD Status")
+        return texts[:start], texts[start:]
+
+    def expected_section(self):
+        return [("DDD Status", "HEADING_2", False),
+                ("Maintained by the ddd agent. Last sync: now.", "NORMAL_TEXT", False),
+                ("Awaiting review", "NORMAL_TEXT", False),
+                ("Login form {#login} - branch ddd/login", "NORMAL_TEXT", True),
+                ("Logout \U0001F642", "NORMAL_TEXT", True),
+                ("Blocked / questions", "NORMAL_TEXT", False),
+                ("Export - question: CSV only?", "NORMAL_TEXT", True)]
+
+    def test_appends_when_missing(self):
+        fake = FakeDoc(self.DEV)
+        before = fake.texts()
+        args = self.write_section(fake)
+        self.assertFalse(args["replaced"])
+        dev, section = self.section(fake)
+        self.assertEqual(dev, before)
+        self.assertEqual(section, self.expected_section())
+
+    def test_replaces_section_in_the_middle(self):
+        old = [("DDD Status", "HEADING_2"), "old note", ("old row", "NORMAL_TEXT", True)]
+        fake = FakeDoc(self.DEV[:4] + old + self.DEV[4:])
+        args = self.write_section(fake)
+        self.assertTrue(args["replaced"])
+        texts = fake.texts()
+        self.assertEqual(texts[:4], FakeDoc(self.DEV[:4]).texts())
+        self.assertEqual(texts[4:11], self.expected_section())
+        self.assertEqual(texts[11:], FakeDoc(self.DEV[4:]).texts())
+
+    def test_replaces_section_at_the_end_and_is_idempotent(self):
+        fake = FakeDoc(self.DEV + [("DDD Status", "HEADING_2"), ("old row", "NORMAL_TEXT", True)])
+        self.write_section(fake)
+        once = fake.texts()
+        self.write_section(fake)
+        self.assertEqual(fake.texts(), once)
+        self.assertEqual(once[:len(self.DEV)], FakeDoc(self.DEV).texts())
+        self.assertEqual(once[len(self.DEV):], self.expected_section())
+
+    def test_heading_only_section_and_empty_status(self):
+        fake = FakeDoc(self.DEV + [("DDD Status", "HEADING_3")])
+        args = self.write_section(fake, "## DDD Status\n\nNothing in progress.\n")
+        self.assertEqual(fake.texts()[-2:], [("DDD Status", "HEADING_3", False),
+                                             ("Nothing in progress.", "NORMAL_TEXT", False)])
+        self.assertEqual(args["expected"][0]["style"], "HEADING_3")  # keeps the doc's level
+
+    def test_pending_suggestion_refuses(self):
+        fake = FakeDoc(self.DEV + [("DDD Status", "HEADING_2"), "old"])
+        fake.attrs[-1]["suggested"] = True
+        with self.assertRaises(ddd.DddError) as cm:
+            ddd.gdoc_status_requests(fake.read(), self.BLOCK, "DDD Status")
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_tabs_and_wrappers(self):
+        fake = FakeDoc(self.DEV, tab="t.plan")
+        read = fake.read()
+        read["tabs"].insert(0, {"tabProperties": {"tabId": "t.notes"},
+                                "documentTab": {"body": {"content": [{"endIndex": 1, "sectionBreak": {}}]}}})
+        args = ddd.gdoc_status_requests(read, self.BLOCK, "DDD Status", "t.plan")
+        fake.apply(args)  # every range carries tabId t.plan, checked by FakeDoc
+        first = ddd.gdoc_status_requests(read, self.BLOCK, "DDD Status")
+        self.assertEqual(first["tabId"], "t.notes")
+        self.assertIn("2 tabs", first["warnings"][0])
+        with self.assertRaises(ddd.DddError):
+            ddd.gdoc_status_requests(read, self.BLOCK, "DDD Status", "t.missing")
+        root = tempfile.mkdtemp(prefix="ddd-gdoc-")
+        self.addCleanup(shutil.rmtree, root, True)
+        raw = json.dumps(fake.read())
+        # connector.json is what the Google Docs connector's read_doc returns:
+        # the documents.get object under "content", not a string
+        connector = json.dumps({"content": fake.read()})
+        for name, data in (("raw.json", raw), ("content.json", json.dumps({"content": raw})),
+                           ("connector.json", connector),
+                           ("connector-blocks.json", json.dumps([{"type": "text", "text": connector}])),
+                           ("blocks.json", json.dumps([{"type": "text", "text": raw}]))):
+            path = os.path.join(root, name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+            self.assertEqual(ddd.load_gdoc_json(path)["revisionId"], fake.revision, name)
+        with open(os.path.join(root, "md.json"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"content": "# Plan"}))
+        with self.assertRaises(ddd.DddError):
+            ddd.load_gdoc_json(os.path.join(root, "md.json"))
+
+    def test_check_reports_differences(self):
+        fake = FakeDoc(self.DEV)
+        args = ddd.gdoc_status_requests(fake.read(), self.BLOCK, "DDD Status")
+        self.assertEqual(ddd.gdoc_status_check(fake.read(), args["expected"], "DDD Status"),
+                         ["no DDD Status section found"])
+        fake.apply(args)
+        fake.attrs[-1]["bullet"] = False
+        self.assertEqual(len(ddd.gdoc_status_check(fake.read(), args["expected"], "DDD Status")), 1)
+
+
 class WorkflowTests(unittest.TestCase):
     PLAN = ("# Plan\n\n## Sign-in {#auth} [next]\n\n- [ ] Login form {#login}\n"
             "  - Done when: bad passwords show an error\n- [ ] Logout button\n\n## Dark mode\n\nTheme toggle.\n")
@@ -536,6 +766,28 @@ class WorkflowTests(unittest.TestCase):
         # the version is remembered without an accept.
         self.assertTrue(self.ddd("diff", ".ddd/tmp/doc.md", "--doc-version", "v2")["doc_unchanged"])
         self.assertTrue(self.ddd("diff", "--doc-version", "v2")["fetch_skipped"])
+
+    def test_gdoc_status_write_cli(self):
+        url = "https://docs.google.com/document/d/abc123_X/edit?tab=t.plan"
+        self.assertEqual(self.ddd("init", "--doc", url, "--force")["config"]["doc"]["tab"], "t.plan")
+        self.write(".ddd/tmp/doc.md", self.PLAN)
+        self.ddd("diff", ".ddd/tmp/doc.md", "--doc-version", "v1")
+        self.ddd("accept")
+        self.ddd("set", "login", "awaiting-review", "--branch", "ddd/login")
+        fake = FakeDoc([("Plan", "TITLE"), ("Sign-in", "HEADING_2"), "Login form"], tab="t.plan")
+        self.write(".ddd/tmp/read.json", json.dumps([{"type": "text", "text": json.dumps(fake.read())}]))
+        self.ddd("status-block", "--gdoc-check", ".ddd/tmp/read.json", code=1)  # nothing written yet
+        args = self.ddd("status-block", "--gdoc-read", ".ddd/tmp/read.json")
+        self.assertEqual(args["writeControl"], {"requiredRevisionId": "rev-1"})
+        self.assertEqual(args["tabId"], "t.plan")
+        fake.apply(args)
+        self.assertIn(("Login form {#login} - branch ddd/login", "NORMAL_TEXT", True), fake.texts())
+        self.write(".ddd/tmp/read.json", json.dumps(fake.read()))
+        self.assertTrue(self.ddd("status-block", "--gdoc-check", ".ddd/tmp/read.json")["ok"])
+        self.assertIn('"status-write"', self.read(".ddd/log.jsonl"))
+        fake.attrs[-1]["bullet"] = False  # someone un-bulleted a row
+        self.write(".ddd/tmp/read.json", json.dumps(fake.read()))
+        self.assertIn("differences", self.ddd("status-block", "--gdoc-check", ".ddd/tmp/read.json", code=1))
 
     def test_test_command_warning(self):
         self.write("gradlew", "#!/bin/sh\n")

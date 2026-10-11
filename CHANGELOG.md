@@ -22,6 +22,18 @@ First version.
   - `survey` reports `base_guess`/`on_base`; Initialize ticks only work on the
     base branch, creates a Google Doc once, never trashes files, and explains
     why `.ddd/` stays uncommitted off the base branch.
+- Status section in a Google Doc through the Google Docs connector:
+  `status-block --gdoc-read` builds the `batchUpdate` requests from a
+  `read_doc` result, saved by the host or trimmed to the fields it reads
+  (replace or append, revision-guarded, tab-aware, refuses over pending
+  suggestions) and `--gdoc-check` verifies a fresh read. Checked on a live
+  doc. `init` keeps the URL's `?tab=`.
+- Initialize: arguments that name the format drop only that question; the
+  one message still goes out when there is a roadmap to raise or the run is
+  off the base branch (behaviour eval 12).
+- Docs: Drive's `modifiedTime` lags edits by a minute or more, so a sync
+  right after an edit may skip it; fetch anyway when the developer says they
+  just edited.
 - Claude Code commands per mode (`/ddd:menu`, `/ddd:auto`, `/ddd:status`,
   `/ddd:setup`, `/ddd:initialize`) so typing `/ddd:` completes them, with
   argument hints. Shipped in the plugin; the installers copy them too.

@@ -58,10 +58,11 @@ or from the request:
    - Google Doc: fetching costs a lot (you retype the whole doc), so check
      first. Get the doc's modified time from the MCP's metadata tool and run
      `ddd diff --doc-version <modifiedTime>`. If `fetch_skipped` is true, the
-     doc is unchanged: skip to step 6. Otherwise read it, preferring the
-     Markdown export, and save it to `.ddd/tmp/`. If the host saved the
-     result to a file, pass that file as is (JSON and base64 are decoded);
-     never retype a saved result. Details and fallbacks:
+     doc is unchanged: skip to step 6 (unless the developer says they just
+     edited it: `modifiedTime` lags edits by a minute or more). Otherwise
+     read it, preferring the Markdown export, and save it to `.ddd/tmp/`. If
+     the host saved the result to a file, pass that file as is (JSON and
+     base64 are decoded); never retype a saved result. Details and fallbacks:
      [references/backends.md](references/backends.md).
 3. `ddd diff` (Google Doc: `ddd diff <file> --doc-version <modifiedTime>`). If
    `doc_unchanged` is true and `needs_input` false, skip to step 6.
@@ -171,8 +172,10 @@ and formatting rules: [references/initialize.md](references/initialize.md).
    raise any existing roadmap or TODO file you found (adopt it via
    [Setup](#setup) instead?) and ask if there is anything the plan must cover.
    If survey's `git.on_base` is false, say which branch you are on and that
-   `.ddd/` can only be committed from the base branch. Draft the rest
-   yourself; don't interview the developer.
+   `.ddd/` can only be committed from the base branch. Arguments that name
+   the format drop only that question: still send the message, and wait for
+   the answer, when there is a roadmap to raise or you are off the base
+   branch. Draft the rest yourself; don't interview the developer.
 3. **Inventory** what is built, partial, broken (failing tests, `FIXME`s) and
    planned (roadmap lines, `TODO`s, unmerged branches). Every planned item
    cites its evidence. "Built" means on the base branch: work on other
@@ -205,14 +208,17 @@ After state changes (each item in auto mode, and the end of every run):
 
 - **Markdown doc:** `ddd status-block --write <doc-path>`. Exit 3 means the
   developer edited the doc meanwhile: re-sync, then write again.
-- **Google Doc:** `ddd status-block` returns the section text. Write it only if
-  the MCP can edit part of a document (replace a range, find-and-replace, insert
-  at the end). Re-read the doc first and confirm `ddd diff .ddd/tmp/doc.md`
-  reports `doc_unchanged`. Then replace only the existing `DDD Status` section,
-  or append it at the end. **Never rewrite the whole document**: that destroys
-  formatting and races the developer's edits. If whole-file replacement is the
-  only write the MCP offers, don't write; say once that status lives in
-  `.ddd/` and comments only.
+- **Google Doc:** write only if a tool can edit part of a document, such as
+  the Google Docs connector (`read_doc` + `update_doc`). Finish the sync first
+  (`doc_unchanged`). Then read the doc's structure, run
+  `ddd status-block --gdoc-read <saved read>`, send its `requests` and
+  `writeControl` in one edit call, read again and run
+  `ddd status-block --gdoc-check <saved read>`. Details and the error cases:
+  [references/backends.md](references/backends.md#writing-the-status-section-partial-edits-only).
+  **Never rewrite the whole document**: that destroys formatting and races the
+  developer's edits. If no tool can edit part of the doc, don't write; say once
+  that status lives in `.ddd/` and comments only, and that connecting the
+  Google Docs connector would let you write the status section.
 - **Comments (Google Doc):** if the MCP can create comments, post one per state
   change, quoting or anchored to the item title, for example `[ddd] {#login}
   awaiting review: branch ddd/login, tests pass (npm test)`. Post questions the
@@ -246,7 +252,7 @@ Detecting what the MCP can do, and caching it in config:
 3. `ddd init --doc <path-or-url> [--base <branch>] [--test "<cmd>"]`. The base
    defaults to the current branch; confirm it if that is not the usual main branch.
 4. Google Doc: probe the MCP (read, partial edit, comments) and record the
-   results, e.g. `ddd config set capabilities.comments true`.
+   results, e.g. `ddd config set capabilities.targeted_edit "update_doc"`.
 5. Run the first sync (Google Doc: with `--doc-version`, so later syncs can
    skip the fetch). Everything is new, so there are no questions. Briefly
    explain the optional markers (`[next]`, `[blocked]`, `[notes]`, `{#tag}`,
