@@ -21,16 +21,23 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
 SCHEMA_VERSION = 1
+MULTI_CONFIG_VERSION = 2  # config.json with "docs" (references/multi-doc.md)
 STATE_DIR = ".ddd"
 STATES = ("todo", "in-progress", "awaiting-review", "done", "blocked", "removed")
 ACTIVE = ("in-progress", "awaiting-review")
 BUILT = ("in-progress", "awaiting-review", "done")
 MARKERS = ("next", "blocked", "notes")
 TRAILER = "DDD-Item"
+# Doc names: short slugs that can't be read as a mode or an item count.
+DOC_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+RESERVED_DOC_NAMES = {"menu", "auto", "status", "setup", "initialize", "all", "ddd", "doc", "docs"}
+# Per-doc settings in a multi-doc config; the rest of config.json is repo-wide.
+DOC_SETTINGS = ("test_command", "branch_prefix", "status_section")
 
 # Matching thresholds; see references/matching.md.
 CONFIDENT = 0.78
@@ -131,6 +138,9 @@ UNICODE_CHECKED = "\u2611\u2612\u2705\u2713\u2714"
 TAG_RE = re.compile(r"\{#([A-Za-z0-9][A-Za-z0-9_-]*)\}")
 MARKER_RE = re.compile(r"\[(next|blocked|notes)\]", re.IGNORECASE)
 ACCEPT_RE = re.compile(r"^(?:[-*+]\s+)?(?:acceptance|accept|done when)\s*:\s*(.*)$", re.IGNORECASE)
+# `Needs: {#tag}` or `Needs: {#doc:tag}`; a Needs line without a reference is prose.
+NEEDS_RE = re.compile(r"^(?:[-*+]\s+)?needs\s*:\s*(.*)$", re.IGNORECASE)
+REF_RE = re.compile(r"\{#([A-Za-z0-9][A-Za-z0-9_-]*(?::[A-Za-z0-9][A-Za-z0-9_-]*)?)\}")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # Google Docs' Markdown export escapes punctuation (\[next\], \{#tag\}).
 UNESCAPE_RE = re.compile(r"\\([\[\]{}#_*\-.!()+`>|~])")
@@ -250,6 +260,7 @@ def parse_doc(text, status_title="DDD Status"):
             "order": len(items),
             "body_lines": [],
             "acceptance": [],
+            "needs": [],
             "indent": indent,
         }
         items.append(item)
@@ -264,6 +275,11 @@ def parse_doc(text, status_title="DDD Status"):
         am = ACCEPT_RE.match(text.strip())
         if am and am.group(1).strip():
             items[idx]["acceptance"].append(clean_inline(am.group(1)))
+        nm = None if in_code else NEEDS_RE.match(text.strip())
+        if nm:
+            for ref in REF_RE.findall(nm.group(1)):
+                if ref not in items[idx]["needs"]:
+                    items[idx]["needs"].append(ref)
         items[idx]["body_lines"].append(cleaned)
 
     for i, raw in enumerate(lines):
@@ -356,24 +372,44 @@ def parse_doc(text, status_title="DDD Status"):
 # --------------------------------------------------------------------------
 # state
 
-class State:
+class Project:
+    """The repo's .ddd/: config, log, and one doc (the original layout) or
+    several named docs under .ddd/docs/<name>/ (references/multi-doc.md)."""
+
     def __init__(self, root):
         self.root = root
         self.dir = os.path.join(root, STATE_DIR)
         self.config_path = os.path.join(self.dir, "config.json")
-        self.items_path = os.path.join(self.dir, "items.json")
         self.log_path = os.path.join(self.dir, "log.jsonl")
-        self.snapshot_path = os.path.join(self.dir, "snapshot.md")
-        self.tmp_dir = os.path.join(self.dir, "tmp")
-        self.pending_path = os.path.join(self.tmp_dir, "pending.json")
-        self.config = merge_defaults(load_json(self.config_path, {}), DEFAULT_CONFIG)
-        data = load_json(self.items_path, None) or {"version": SCHEMA_VERSION, "items": {},
-                                                    "doc_hash": None, "last_sync": None}
-        self.data = data
-        self.items = data["items"]
+        raw = load_json(self.config_path, {})
+        self.multi = isinstance(raw.get("docs"), dict)
+        self.config = merge_defaults(raw, DEFAULT_CONFIG)
+        if self.multi:
+            self.config.pop("doc", None)
+            order = [n for n in self.config.get("doc_order", []) if n in self.config["docs"]]
+            self.config["doc_order"] = order + sorted(n for n in self.config["docs"] if n not in order)
+        self._docs = {}
 
-    def save(self):
-        save_json(self.items_path, self.data)
+    @property
+    def project(self):
+        return self
+
+    def names(self):
+        return list(self.config["doc_order"]) if self.multi else [None]
+
+    def doc(self, name=None):
+        if not self.multi:
+            if name:
+                raise DddError("this project has one doc; doc names exist after `ddd.py doc add`")
+            name = None
+        elif name not in self.config["docs"]:
+            raise DddError("no doc named %r; docs: %s" % (name, ", ".join(self.names())))
+        if name not in self._docs:
+            self._docs[name] = State(self.root, name, self)
+        return self._docs[name]
+
+    def docs(self):
+        return [self.doc(n) for n in self.names()]
 
     def save_config(self):
         save_json(self.config_path, self.config)
@@ -384,13 +420,156 @@ class State:
         with open(self.log_path, "a", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
-    def resolve_id(self, ident):
+    def resolve_doc(self, name=None):
+        """The doc a command works on: --doc, the only doc, or the doc whose
+        scope holds the working directory."""
+        if not self.multi or name:
+            return self.doc(name)
+        names = self.names()
+        if len(names) == 1:
+            return self.doc(names[0])
+        rel = os.path.relpath(os.path.abspath(os.getcwd()), self.root).replace("\\", "/")
+        best = None
+        for n in names:
+            scope = (self.config["docs"][n].get("scope") or "").strip("/")
+            if scope and (rel == scope or rel.startswith(scope + "/")):
+                if best is None or len(scope) > len(best[1]):
+                    best = (n, scope)
+        if best:
+            return self.doc(best[0])
+        raise DddError("this project has several docs; pass --doc NAME (or run inside a doc's scope)",
+                       code=2, docs=names)
+
+    def resolve_item(self, ident, name=None):
+        """(State, id) for an item id: `doc:id`, or an id unique across docs."""
+        if ":" in ident:
+            dname, iid = ident.split(":", 1)
+            if self.multi and dname in self.config["docs"]:
+                st = self.doc(dname)
+                found = st.find_id(iid)
+                if found:
+                    return st, found
+            moved = self.find_moved(ident)
+            if moved:
+                return moved
+            raise DddError("unknown item id: %s" % ident)
+        if name or not self.multi:
+            st = self.resolve_doc(name) if name else self.doc()
+            return st, st.resolve_id(ident)
+        hits = [(st, st.find_id(ident)) for st in self.docs()]
+        hits = [(st, iid) for st, iid in hits if iid]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise DddError("%s is in several docs; use one of: %s"
+                           % (ident, ", ".join(st.qid(i) for st, i in hits)), code=2)
+        raise DddError("unknown item id: %s" % ident)
+
+    def find_moved(self, qid):
+        for st in self.docs():
+            for iid, rec in st.items.items():
+                if qid in rec.get("moved_from", []):
+                    return st, iid
+        return None
+
+    def lookup(self, ref, from_state):
+        """(State, id) for a Needs reference, or None."""
+        if ":" in ref:
+            if not self.multi:
+                return None
+            try:
+                return self.resolve_item(ref)
+            except DddError:
+                return None
+        iid = from_state.find_id(ref)
+        return (from_state, iid) if iid else None
+
+
+class State:
+    """One doc's state: its items, snapshot and pending diff. `config` is the
+    repo-wide config with the doc's own settings on top."""
+
+    def __init__(self, root, name=None, project=None):
+        self.root = root
+        self.name = name
+        self.project = project or Project(root)
+        self.dir = os.path.join(root, STATE_DIR)
+        self.config_path = self.project.config_path
+        self.log_path = self.project.log_path
+        self.doc_dir = os.path.join(self.dir, "docs", name) if name else self.dir
+        self.items_path = os.path.join(self.doc_dir, "items.json")
+        self.snapshot_path = os.path.join(self.doc_dir, "snapshot.md")
+        self.tmp_dir = os.path.join(self.doc_dir, "tmp")
+        self.pending_path = os.path.join(self.tmp_dir, "pending.json")
+        if name:
+            pc = self.project.config
+            doc = pc["docs"][name]
+            cfg = {k: v for k, v in pc.items() if k not in ("docs", "doc_order")}
+            for k in DOC_SETTINGS:
+                if doc.get(k) is not None:
+                    cfg[k] = doc[k]
+            if doc.get("branch_prefix") is None:
+                cfg["branch_prefix"] = (pc.get("branch_prefix") or "ddd/") + name + "/"
+            cfg["doc"] = {k: doc.get(k) for k in ("type", "path", "url", "id", "tab", "scope")}
+            self.config = cfg
+        else:
+            self.config = self.project.config
+        data = load_json(self.items_path, None) or {"version": SCHEMA_VERSION, "items": {},
+                                                    "doc_hash": None, "last_sync": None}
+        self.data = data
+        self.items = data["items"]
+
+    def save(self):
+        save_json(self.items_path, self.data)
+
+    def save_config(self):
+        self.project.save_config()
+
+    def log(self, entry):
+        entry = dict(entry)
+        if self.name:
+            entry.setdefault("doc", self.name)
+        self.project.log(entry)
+
+    def qid(self, iid):
+        return "%s:%s" % (self.name, iid) if self.name else iid
+
+    def find_id(self, ident):
         if ident in self.items:
             return ident
         for iid, it in self.items.items():
             if ident in it.get("aliases", []):
                 return iid
+        return None
+
+    def resolve_id(self, ident):
+        found = self.find_id(ident)
+        if found:
+            return found
+        if ":" in ident:
+            hit = self.project.resolve_item(ident)
+            if hit[0] is self:
+                return hit[1]
         raise DddError("unknown item id: %s" % ident)
+
+    def trailer_names(self, iid):
+        """Every `DDD-Item:` value this item's commits may carry: its qualified
+        id, ids it had before (aliases, moves, a renamed doc), and bare ids in
+        a single-doc project or for commits made before the project went multi-doc."""
+        rec = self.items.get(iid, {})
+        bare = [iid] + rec.get("aliases", [])
+        if not self.name:
+            return bare
+        doc = self.project.config["docs"][self.name]
+        names = [self.qid(b) for b in bare]
+        names += ["%s:%s" % (old, b) for old in doc.get("former_names", []) for b in bare]
+        names += rec.get("moved_from", []) + rec.get("old_trailers", [])
+        if doc.get("legacy_trailers"):
+            names += bare
+        return names
+
+    def trailer(self, iid):
+        return "%s: %s" % (TRAILER, self.qid(iid))
 
     def status_title(self):
         return self.config.get("status_section") or "DDD Status"
@@ -420,11 +599,21 @@ def find_root(start):
         cur = parent
 
 
-def load_state(args):
+def load_project(args):
     root = args.root or find_root(os.getcwd())
     if not root or not os.path.isdir(os.path.join(root, STATE_DIR)):
         raise DddError("no .ddd/ found; run `ddd.py init --doc <path-or-url>` at the project root")
-    return State(os.path.abspath(root))
+    return Project(os.path.abspath(root))
+
+
+def load_state(args):
+    """The doc a command works on (see Project.resolve_doc)."""
+    return load_project(args).resolve_doc(getattr(args, "doc_name", None))
+
+
+def load_item(args, ident=None):
+    """(State, id) for the command's item id, qualified (`doc:id`) or not."""
+    return load_project(args).resolve_item(ident or args.id, getattr(args, "doc_name", None))
 
 
 # --------------------------------------------------------------------------
@@ -673,11 +862,16 @@ def unique_id(base, taken):
     return cand
 
 
-def apply_diff(state, doc, result, text, splits=None, merges=None):
+def apply_diff(state, doc, result, text, splits=None, merges=None, imports=None, moved_out=None):
+    """Apply a diff. `imports` {key: (qualified source id, record)} are items
+    moved here from another doc: they keep their state, branch and history.
+    `moved_out` are ids moving to another doc: never marked removed here."""
     prev = state.items
     ts = now_iso()
     matches = result["matches"]
     report = result["report"]
+    imports = imports or {}
+    moved_out = set(moved_out or [])
     taken = set(prev)
     for it in prev.values():
         taken.update(it.get("aliases", []))
@@ -687,7 +881,34 @@ def apply_diff(state, doc, result, text, splits=None, merges=None):
 
     for it in doc["items"]:
         m = matches.get(it["key"])
-        if m:
+        if it["key"] in imports:
+            src, rec = imports[it["key"]]
+            rec = json.loads(json.dumps(rec))
+            if it["tag"] and it["tag"] not in taken:
+                iid = it["tag"]
+            elif rec.get("id") and rec["id"] not in taken:
+                iid = rec["id"]
+            else:
+                iid = unique_id(it["tag"] or slugify(it["title"]), taken)
+            taken.add(iid)
+            src_doc = src.split(":", 1)[0]
+            rec["moved_from"] = rec.get("moved_from", []) + [src] +                 ["%s:%s" % (src_doc, a) for a in rec.get("aliases", [])]
+            rec["aliases"] = []
+            rec["id"] = iid
+            if rec.get("state") == "removed":
+                rec["state"] = rec.pop("prev_state", None) or "todo"
+                rec.pop("removed_at", None)
+            rec["flags"] = [f for f in rec.get("flags", []) if f != "removed-from-doc"]
+            if it["title_norm"] != rec.get("title_norm") or it["body_norm"] != rec.get("body_norm"):
+                rec.setdefault("edits", []).append(ts)
+                if rec.get("state") in BUILT and "changed-after-build" not in rec["flags"]:
+                    rec["flags"].append("changed-after-build")
+            if not rec["flags"]:
+                rec.pop("flags")
+            new_items[iid] = rec
+            key_to_id[it["key"]] = iid
+            state.log({"type": "move", "item": iid, "from": src, "title": it["title"]})
+        elif m:
             iid = m["id"]
             rec = new_items.pop(iid)
             if it["tag"] and it["tag"] != iid and it["tag"] not in taken:
@@ -722,7 +943,7 @@ def apply_diff(state, doc, result, text, splits=None, merges=None):
                 new_items[iid]["done_by"] = "developer"
         rec = new_items[key_to_id[it["key"]]]
         for field in ("kind", "level", "title", "tag", "markers", "inherited", "checked",
-                      "line", "order", "body", "acceptance", "title_norm", "body_norm"):
+                      "line", "order", "body", "acceptance", "needs", "title_norm", "body_norm"):
             rec[field] = it[field]
         rec["parent_key"] = it["parent"]
         rec["seen"] = ts
@@ -734,7 +955,7 @@ def apply_diff(state, doc, result, text, splits=None, merges=None):
 
     seen_ids = set(key_to_id.values())
     for iid, rec in new_items.items():
-        if iid in seen_ids or rec.get("state") == "removed":
+        if iid in seen_ids or iid in moved_out or rec.get("state") == "removed":
             continue
         if rec.get("state") in ACTIVE:
             rec.setdefault("flags", [])
@@ -770,13 +991,16 @@ def apply_diff(state, doc, result, text, splits=None, merges=None):
         state.log({"type": "doc-change", "item": key_to_id[c["key"]], "changes": c["types"],
                    "title": c["title"], "old_title": c["old_title"], "doc_hash": doc["hash"]})
     for n in report["new"]:
-        state.log({"type": "doc-change", "item": key_to_id[n["key"]], "changes": ["new"],
-                   "title": n["title"], "doc_hash": doc["hash"]})
+        if n["key"] not in imports:
+            state.log({"type": "doc-change", "item": key_to_id[n["key"]], "changes": ["new"],
+                       "title": n["title"], "doc_hash": doc["hash"]})
     for r in report["removed"]:
-        state.log({"type": "doc-change", "item": r["id"], "changes": ["removed"],
-                   "title": r["title"], "doc_hash": doc["hash"]})
+        if r["id"] not in moved_out:
+            state.log({"type": "doc-change", "item": r["id"], "changes": ["removed"],
+                       "title": r["title"], "doc_hash": doc["hash"]})
     for c in report["conflicts"]:
-        state.log({"type": "conflict", "item": c["id"], "conflict": c["type"]})
+        if c["id"] not in moved_out:
+            state.log({"type": "conflict", "item": c["id"], "conflict": c["type"]})
     return key_to_id
 
 
@@ -795,7 +1019,34 @@ def effective(rec):
     return set(rec.get("markers", [])) | set(rec.get("inherited", []))
 
 
+def needs_status(state, rec):
+    """What the item's `Needs:` references say about starting it.
+
+    Returns (open, stack_on, unresolved): `open` lists needs not done yet as
+    {"ref", "id", "state"}; `stack_on` is the branch to build on when the only
+    open need is awaiting review; `unresolved` lists references that match no
+    item. The item waits when `open` is non-empty and `stack_on` is None."""
+    open_, unresolved = [], []
+    for ref in rec.get("needs") or []:
+        hit = state.project.lookup(ref, state)
+        if not hit:
+            unresolved.append(ref)
+            continue
+        st, iid = hit
+        other = st.items[iid]
+        if other.get("state") == "done" or other.get("checked") or other.get("state") == "removed":
+            continue
+        open_.append({"ref": ref, "id": st.qid(iid), "state": other.get("state", "todo"),
+                      "branch": other.get("branch")})
+    stack_on = None
+    if len(open_) == 1 and open_[0]["state"] == "awaiting-review" and open_[0]["branch"]:
+        stack_on = open_[0]["branch"]
+    return open_, stack_on, unresolved
+
+
 def candidates(state, queued_only=False):
+    """(candidates, blocked, waiting) for one doc. Ids are qualified (`doc:id`)
+    in a multi-doc project."""
     items = state.items
     now = dt.datetime.now(dt.timezone.utc)
     half = float(state.config.get("hot_half_life_days") or 7)
@@ -810,7 +1061,7 @@ def candidates(state, queued_only=False):
             open_children.setdefault(p, []).append(iid)
     total = max(len(live), 1)
     last_sync = state.data.get("last_sync")
-    out, blocked = [], []
+    out, blocked, waiting = [], [], []
     for iid, r in live.items():
         eff = effective(r)
         if "notes" in eff or r.get("state") in ("done", "awaiting-review") or r.get("checked"):
@@ -820,7 +1071,7 @@ def candidates(state, queued_only=False):
         if r.get("kind") == "heading" and not r.get("body"):
             continue
         if "blocked" in eff or r.get("state") == "blocked":
-            blocked.append({"id": iid, "title": r.get("title"),
+            blocked.append({"id": state.qid(iid), "title": r.get("title"),
                             "reason": r.get("blocked_reason") or ("[blocked] in doc" if "blocked" in eff else None),
                             "question": r.get("question")})
             continue
@@ -828,24 +1079,37 @@ def candidates(state, queued_only=False):
         if queued_only and not queued:
             continue
         resume = r.get("state") == "in-progress"
+        open_needs, stack_on, unresolved = needs_status(state, r)
+        if open_needs and not stack_on and not resume:
+            waiting.append({"id": state.qid(iid), "title": r.get("title"), "queued": queued,
+                            "needs": open_needs})
+            continue
         hot = hot_score(r, now, half)
         is_new = bool(last_sync and r.get("created") == last_sync)
         order_bonus = 1.0 - r.get("order", 0) / total
         score = (200 if resume else 0) + (100 if queued else 0) + 10 * hot + (5 if is_new else 0) + 5 * order_bonus
         parent = items.get(r.get("parent")) if r.get("parent") else None
-        out.append({
-            "id": iid, "title": r.get("title"), "kind": r.get("kind"), "state": r.get("state"),
+        signals = {"queued": queued, "resume": resume, "hot": hot, "new": is_new,
+                   "flags": r.get("flags", [])}
+        if stack_on:
+            signals["stack_on"] = stack_on
+        if unresolved:
+            signals["needs_unresolved"] = unresolved
+        cand = {
+            "id": state.qid(iid), "title": r.get("title"), "kind": r.get("kind"), "state": r.get("state"),
             "parent": parent.get("title") if parent else None, "branch": r.get("branch"),
             "score": round(score, 2), "order": r.get("order", 0),
-            "signals": {"queued": queued, "resume": resume, "hot": hot, "new": is_new,
-                        "flags": r.get("flags", [])},
+            "signals": signals,
             "acceptance": r.get("acceptance", []), "body": (r.get("body") or "")[:400],
-        })
+        }
+        if state.name:
+            cand["doc"] = state.name
+        out.append(cand)
     if queued_only:
         out.sort(key=lambda c: (not c["signals"]["resume"], c["order"]))
     else:
         out.sort(key=lambda c: (-c["score"], c["order"]))
-    return out, blocked
+    return out, blocked, waiting
 
 
 # --------------------------------------------------------------------------
@@ -854,11 +1118,17 @@ def candidates(state, queued_only=False):
 def render_status(state):
     items = state.items
     title = state.status_title()
-    groups = {"in-progress": [], "awaiting-review": [], "blocked": [], "done": []}
+    groups = {"in-progress": [], "awaiting-review": [], "blocked": [], "waiting": [], "done": []}
+    waits = {}
     for iid, r in sorted(items.items(), key=lambda kv: kv[1].get("order", 0)):
         st = r.get("state")
         if st in groups:
             groups[st].append((iid, r))
+        elif st == "todo" and "next" in effective(r) and "notes" not in effective(r)                 and "blocked" not in effective(r):
+            open_needs, stack_on, _ = needs_status(state, r)
+            if open_needs and not stack_on:
+                waits[iid] = open_needs
+                groups["waiting"].append((iid, r))
     groups["done"] = sorted((p for p in groups["done"] if p[1].get("done_by") != "developer"),
                             key=lambda p: p[1].get("done_at", ""), reverse=True)[:10]
 
@@ -874,13 +1144,15 @@ def render_status(state):
             bits.append("doc changed after build")
         if "removed-from-doc" in r.get("flags", []):
             bits.append("removed from doc while active")
+        if iid in waits:
+            bits.append("needs " + ", ".join("%s (%s)" % (n["id"], n["state"]) for n in waits[iid]))
         return "- %s%s%s" % (r.get("title"), tag, (" - " + "; ".join(bits)) if bits else "")
 
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out = ["## %s" % title, "",
            "_Maintained by the ddd agent; edits in this section are overwritten. Last sync: %s._" % stamp, ""]
     labels = (("in-progress", "In progress"), ("awaiting-review", "Awaiting review"),
-              ("blocked", "Blocked / questions"), ("done", "Recently done"))
+              ("blocked", "Blocked / questions"), ("waiting", "Waiting"), ("done", "Recently done"))
     any_rows = False
     for key, label in labels:
         if groups[key]:
@@ -1150,7 +1422,7 @@ def gdoc_status_check(doc, expected, status_title, tab_id=None):
 # git
 
 def git(state_or_root, *argv, check=True):
-    root = state_or_root.root if isinstance(state_or_root, State) else state_or_root
+    root = state_or_root if isinstance(state_or_root, str) else state_or_root.root
     proc = subprocess.run(["git"] + list(argv), cwd=root, capture_output=True)
     out = proc.stdout.decode("utf-8", "replace").strip()
     err = proc.stderr.decode("utf-8", "replace").strip()
@@ -1176,12 +1448,17 @@ def floating_paths(state):
     belonging to a branch: the state dir and a local Markdown doc. Both are
     live working files (the developer edits the doc mid-run, the agent writes
     its status section into it), so they never make the tree dirty.
+    With several docs, every doc's Markdown file floats, so one doc's status
+    write never blocks work on another.
     Guarded by tests/test_ddd.py: test_auto_builds_second_item_after_status_write,
-    test_developer_doc_edits_survive_branch_switches, test_state_floats_across_branches."""
+    test_developer_doc_edits_survive_branch_switches, test_state_floats_across_branches,
+    MultiDocTests.test_other_docs_float."""
+    project = state.project
+    docs = [project.config["docs"][n] for n in project.names()] if project.multi         else [project.config.get("doc") or {}]
     paths = [STATE_DIR]
-    doc = state.config.get("doc") or {}
-    if doc.get("type") == "markdown" and doc.get("path") and not doc["path"].startswith(".."):
-        paths.append(doc["path"])
+    for doc in docs:
+        if doc.get("type") == "markdown" and doc.get("path") and not doc["path"].startswith("..")                 and doc["path"] not in paths:
+            paths.append(doc["path"])
     return paths
 
 
@@ -1218,7 +1495,7 @@ def checkout(state, branch, create_from=None):
     backup = {}
     files = []
     for dirpath, dirnames, filenames in os.walk(state.dir):
-        dirnames[:] = [d for d in dirnames if os.path.join(dirpath, d) != state.tmp_dir]
+        dirnames[:] = [d for d in dirnames if d != "tmp"]  # .ddd/tmp/, .ddd/docs/<name>/tmp/
         files.extend(os.path.join(dirpath, fn) for fn in filenames)
     for rel in floating_paths(state)[1:]:
         if os.path.isfile(os.path.join(state.root, rel)):
@@ -1280,16 +1557,7 @@ def cmd_init(args):
         raise DddError(".ddd/ already initialised at %s (use --force to overwrite config)" % root)
     os.makedirs(os.path.join(d, "tmp"), exist_ok=True)
     cfg = merge_defaults({}, DEFAULT_CONFIG)
-    doc = args.doc
-    m = re.search(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)", doc)
-    if m:
-        cfg["doc"] = {"type": "gdoc", "url": doc, "id": m.group(1), "path": None}
-        tab = re.search(r"[?&#]tab=(t\.[A-Za-z0-9_-]+)", doc)
-        if tab:
-            cfg["doc"]["tab"] = tab.group(1)
-    else:
-        rel = os.path.relpath(os.path.abspath(os.path.join(root, doc)), root).replace("\\", "/")
-        cfg["doc"] = {"type": "markdown", "path": rel, "url": None, "id": None}
+    cfg["doc"] = doc_source(root, args.doc)
     if args.base:
         cfg["base_branch"] = args.base
     else:
@@ -1312,18 +1580,486 @@ def cmd_init(args):
     emit({"ok": True, "root": root, "config": cfg, "warnings": test_command_warnings(root, args.test)})
 
 
-def cmd_info(args):
-    st = load_state(args)
+def doc_summary(st):
     counts = {}
     for r in st.items.values():
         counts[r.get("state", "todo")] = counts.get(r.get("state", "todo"), 0) + 1
-    info = {"root": st.root, "config": st.config, "doc_hash": st.data.get("doc_hash"),
+    return {"doc_hash": st.data.get("doc_hash"), "doc_version": st.data.get("doc_version"),
             "last_sync": st.data.get("last_sync"), "states": counts,
             "pending_diff": os.path.exists(st.pending_path),
-            "flagged": {iid: r["flags"] for iid, r in st.items.items() if r.get("flags")}}
-    if os.path.isdir(os.path.join(st.root, ".git")) or git(st, "rev-parse", "--git-dir", check=False)[0] == 0:
-        info["git"] = {"branch": current_branch(st), "dirty": dirty_files(st)}
+            "flagged": {st.qid(iid): r["flags"] for iid, r in st.items.items() if r.get("flags")}}
+
+
+def cmd_info(args):
+    project = load_project(args)
+    if project.multi:
+        docs = []
+        for st in selected_docs(args):
+            d = {"name": st.name, "doc": st.config["doc"], "branch_prefix": st.config.get("branch_prefix"),
+                 "test_command": st.config.get("test_command"), "status_section": st.status_title(),
+                 "wait_for": project.config["docs"][st.name].get("wait_for") or []}
+            d.update(doc_summary(st))
+            docs.append(d)
+        info = {"root": project.root, "config": project.config, "docs": docs}
+    else:
+        st = project.doc()
+        info = dict({"root": st.root, "config": st.config}, **doc_summary(st))
+        info.pop("doc_version")
+    if os.path.isdir(os.path.join(project.root, ".git")) or \
+            git(project, "rev-parse", "--git-dir", check=False)[0] == 0:
+        info["git"] = {"branch": current_branch(project), "dirty": dirty_files(project)}
     emit(info)
+
+
+def doc_source(root, source):
+    """Config fields for a doc given as a Google Docs URL or a Markdown path."""
+    m = re.search(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)", source)
+    if m:
+        doc = {"type": "gdoc", "url": source, "id": m.group(1), "path": None}
+        tab = re.search(r"[?&#]tab=(t\.[A-Za-z0-9_-]+)", source)
+        if tab:
+            doc["tab"] = tab.group(1)
+        return doc
+    rel = os.path.relpath(os.path.abspath(os.path.join(root, source)), root).replace("\\", "/")
+    return {"type": "markdown", "path": rel, "url": None, "id": None}
+
+
+def doc_name_problem(root, name, prefix, taken=()):
+    """Why `name` can't name a doc, or None."""
+    if not DOC_NAME_RE.match(name or "") or name in RESERVED_DOC_NAMES:
+        return ("doc name %r: use a short slug starting with a letter (a-z, 0-9, -), not one of %s"
+                % (name, ", ".join(sorted(RESERVED_DOC_NAMES))))
+    if name in taken:
+        return "there is already a doc named %s" % name
+    # git can't hold a branch ddd/<name> next to branches under ddd/<name>/
+    if git(root, "rev-parse", "--git-dir", check=False)[0] == 0 and \
+            git(root, "rev-parse", "--verify", "--quiet", "refs/heads/" + prefix + name, check=False)[0] == 0:
+        return ("branch %s%s exists, so items of a doc named %s can't use %s%s/<id>; pick another name"
+                % (prefix, name, name, prefix, name))
+    return None
+
+
+def check_doc_name(project, name, prefix):
+    problem = doc_name_problem(project.root, name, prefix, project.config["docs"] if project.multi else ())
+    if problem:
+        raise DddError(problem)
+
+
+def migrate_to_multi(project, first):
+    """Turn the single-doc layout into a multi-doc one, naming the doc `first`.
+    Its items keep their ids and recorded branches; its old bare trailers stay
+    recognised (`legacy_trailers`)."""
+    cfg = project.config
+    prefix = cfg.get("branch_prefix") or "ddd/"
+    check_doc_name(project, first, prefix)
+    dest = os.path.join(project.dir, "docs", first)
+    os.makedirs(os.path.join(dest, "tmp"), exist_ok=True)
+    for fn in ("items.json", "snapshot.md"):
+        if os.path.exists(os.path.join(project.dir, fn)):
+            os.replace(os.path.join(project.dir, fn), os.path.join(dest, fn))
+    old_tmp = os.path.join(project.dir, "tmp")
+    if os.path.isdir(old_tmp):
+        for fn in os.listdir(old_tmp):
+            os.replace(os.path.join(old_tmp, fn), os.path.join(dest, "tmp", fn))
+        os.rmdir(old_tmp)
+    doc = dict(cfg.pop("doc"))
+    doc["legacy_trailers"] = True
+    cfg["docs"] = {first: doc}
+    cfg["doc_order"] = [first]
+    cfg["version"] = MULTI_CONFIG_VERSION
+    project.multi = True
+    project._docs = {}
+    project.save_config()
+    project.log({"type": "doc-migrate", "doc": first})
+
+
+def cmd_doc(args):
+    if args.action == "suggest":
+        cmd_doc_suggest(args)
+        return
+    project = load_project(args)
+    cfg = project.config
+    prefix = cfg.get("branch_prefix") or "ddd/"
+    if args.action == "list":
+        if not project.multi:
+            emit({"multi": False, "docs": [{"name": None, "doc": cfg.get("doc")}]})
+            return
+        emit({"multi": True, "docs": [dict({"name": st.name, "doc": st.config["doc"],
+                                            "branch_prefix": st.config.get("branch_prefix")},
+                                           **doc_summary(st)) for st in project.docs()]})
+        return
+    if args.action == "add":
+        if not args.name or not args.source:
+            raise DddError("usage: doc add NAME PATH|URL [--scope DIR] [--test CMD] [--first-name NAME]")
+        migrated = None
+        for q in args.wait_for or []:
+            project.resolve_item(q)  # refuse an unknown id before changing anything
+        if not project.multi:
+            if not args.first_name:
+                raise DddError("this project has one doc (%s); name it with --first-name NAME so both docs "
+                               "have names" % (cfg["doc"].get("path") or cfg["doc"].get("url")), code=2)
+            if args.first_name == args.name:
+                raise DddError("the two docs need different names")
+            check_doc_name(project, args.name, prefix)
+            migrate_to_multi(project, args.first_name)
+            migrated = args.first_name
+        check_doc_name(project, args.name, prefix)
+        doc = doc_source(project.root, args.source)
+        for other, od in project.config["docs"].items():
+            if (od.get("id") and od.get("id") == doc.get("id") and od.get("tab") == doc.get("tab")) or \
+                    (od.get("path") and od.get("path") == doc.get("path")):
+                raise DddError("doc %s already tracks %s" % (other, args.source))
+        if args.scope:
+            scope = os.path.relpath(os.path.abspath(os.path.join(project.root, args.scope)),
+                                    project.root).replace("\\", "/")
+            if scope.startswith(".."):
+                raise DddError("--scope must be inside the project")
+            doc["scope"] = scope
+        if args.test:
+            doc["test_command"] = args.test
+        if args.wait_for:
+            doc["wait_for"] = [other.qid(iid) for other, iid in (project.resolve_item(q) for q in args.wait_for)]
+        project.config["docs"][args.name] = doc
+        project.config["doc_order"].append(args.name)
+        os.makedirs(os.path.join(project.dir, "docs", args.name, "tmp"), exist_ok=True)
+        save_json(os.path.join(project.dir, "docs", args.name, "items.json"),
+                  {"version": SCHEMA_VERSION, "items": {}, "doc_hash": None, "last_sync": None})
+        project.save_config()
+        project.log({"type": "doc-add", "doc": args.name, "source": doc})
+        emit({"ok": True, "added": args.name, "migrated": migrated, "docs": project.names(),
+              "branch_prefix": prefix + args.name + "/",
+              "warnings": test_command_warnings(project.root, args.test)})
+        return
+    if not project.multi:
+        raise DddError("this project has one doc; `doc add` names it and adds another")
+    if args.action == "rename":
+        old, new = args.name, args.source
+        if old not in project.config["docs"]:
+            raise DddError("no doc named %s" % old)
+        check_doc_name(project, new, prefix)
+        doc = project.config["docs"].pop(old)
+        doc["former_names"] = doc.get("former_names", []) + [old]
+        if doc.get("branch_prefix") is None:
+            doc["branch_prefix"] = prefix + old + "/"  # existing and future branches keep one prefix
+        project.config["docs"][new] = doc
+        project.config["doc_order"] = [new if n == old else n for n in project.config["doc_order"]]
+        src, dst = os.path.join(project.dir, "docs", old), os.path.join(project.dir, "docs", new)
+        if os.path.isdir(src):
+            os.replace(src, dst)
+        project.save_config()
+        project.log({"type": "doc-rename", "doc": new, "from": old})
+        emit({"ok": True, "renamed": old, "to": new, "docs": project.names()})
+        return
+    if args.action == "remove":
+        st = project.doc(args.name)
+        active = [st.qid(i) for i, r in st.items.items() if r.get("state") in ACTIVE]
+        if active and not args.force:
+            raise DddError("doc %s has items in progress or awaiting review: %s; finish or drop them, or pass "
+                           "--force" % (args.name, ", ".join(active)), code=2, active=active)
+        if len(project.config["docs"]) == 1:
+            raise DddError("can't remove the last doc")
+        del project.config["docs"][args.name]
+        project.config["doc_order"].remove(args.name)
+        shutil.rmtree(st.doc_dir, ignore_errors=True)
+        project.save_config()
+        project.log({"type": "doc-remove", "doc": args.name, "items": len(st.items)})
+        emit({"ok": True, "removed": args.name, "docs": project.names()})
+        return
+    raise DddError("unknown doc action %s" % args.action)
+
+
+# --------------------------------------------------------------------------
+# doc suggest: a best guess at the `doc add` settings, for the developer to
+# confirm (references/multi-doc.md, "Adding a doc interactively")
+
+GENERIC_WORDS = {"plan", "plans", "planning", "roadmap", "doc", "docs", "document", "spec", "specs",
+                 "todo", "todos", "backlog", "notes", "readme", "design", "milestone", "milestones",
+                 "draft", "project", "the", "a", "an", "and", "of", "for", "v1", "v2", "md", "main", "src"}
+DOC_FOLDERS = {"doc", "docs", "documentation", "plan", "plans", "planning", "notes", "design", "wiki"}
+SCOPE_DEPTH = 3
+
+
+def name_words(text):
+    """Lowercase words of a title or path, generic words dropped:
+    'Clash plan' and 'ClashPlan.md' both give ['clash']."""
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", os.path.splitext(text)[0] if text.endswith(".md") else text)
+    return [w for w in re.split(r"[^a-z0-9]+", text.lower()) if w and w not in GENERIC_WORDS]
+
+
+def name_options(*texts):
+    """Doc-name slugs from the given texts, best first: one word, then two."""
+    out = []
+    for text in texts:
+        words = name_words(text or "")
+        for n in (1, 2):
+            if len(words) >= n:
+                slug = "-".join(words[:n])[:32].strip("-")
+                if slug and slug[0].isalpha() and slug not in out:
+                    out.append(slug)
+    return out
+
+
+def doc_title(doc):
+    heads = [it for it in doc["items"] if it["kind"] == "heading"]
+    top = [it for it in heads if it["level"] == 1]
+    return (top or heads or [{"title": None}])[0]["title"]
+
+
+def scope_candidates(root, files, text, title, source):
+    """Folders the doc probably plans, best first, each with its reasons."""
+    dirs = set()
+    for f in files:
+        parts = f.split("/")[:-1]
+        for n in range(1, min(len(parts), SCOPE_DEPTH) + 1):
+            dirs.add("/".join(parts[:n]))
+    title_words = set(name_words(title or ""))
+    if source.get("path"):
+        title_words |= set(name_words(os.path.basename(source["path"])))
+    doc_dir = os.path.dirname(source["path"]).replace("\\", "/") if source.get("path") else ""
+    manifests = {f.rsplit("/", 1)[0] for f in files if "/" in f and f.rsplit("/", 1)[1] in MANIFESTS}
+    low = text.lower()
+    out = []
+    for d in dirs:
+        base = d.rsplit("/", 1)[-1]
+        if base.lower() in DOC_FOLDERS or base.startswith("."):
+            continue
+        why, score = [], 0
+        hits = len(re.findall(r"(?<![\w./-])%s(?=/|[^\w-]|$)" % re.escape(d.lower()), low)) if "/" in d else \
+            len(re.findall(r"(?<![\w./-])%s/" % re.escape(d.lower()), low))
+        if hits:
+            score += min(hits, 5)
+            why.append("named %d time%s in the doc" % (hits, "" if hits == 1 else "s"))
+        if title_words & set(name_words(base)):
+            score += 3
+            why.append("matches the doc's title")
+        if doc_dir and (doc_dir == d or doc_dir.startswith(d + "/")) and doc_dir.count("/") - d.count("/") <= 1:
+            score += 4 if doc_dir == d else 2
+            why.append("holds the doc")
+        if score and d in manifests:
+            score += 2
+            why.append("has its own build file")
+        if score:
+            out.append({"path": d, "score": score, "why": why})
+    out.sort(key=lambda c: (-c["score"], c["path"].count("/"), c["path"]))
+    return out[:5]
+
+
+def gradle_project(root, files, scope):
+    """`:games:clash` for a Gradle subproject in games/clash, as settings.gradle names it."""
+    settings = next((f for f in ("settings.gradle.kts", "settings.gradle") if f in files), None)
+    text = (read_small_text(os.path.join(root, settings)) or "") if settings else ""
+    nested = scope.replace("/", ":")
+    base = scope.rsplit("/", 1)[-1]
+    if re.search(r"""["']:?%s["']""" % re.escape(nested), text):
+        return ":" + nested
+    if "/" in scope and re.search(r"""["']:?%s["']""" % re.escape(base), text):
+        return ":" + base
+    return ":" + nested
+
+
+def scope_test_command(root, files, scope):
+    """(command, reason) for the tests of the code in `scope`, or (None, None)."""
+    fs = set(files)
+    at = lambda name: "%s/%s" % (scope, name) in fs  # noqa: E731
+    if at("build.gradle") or at("build.gradle.kts"):
+        if "gradlew" not in fs and at("gradlew"):
+            return "./%s/gradlew -p %s test" % (scope, scope), scope + " has its own Gradle wrapper"
+        wrapper = "./gradlew" if "gradlew" in fs else "gradle"
+        return wrapper + " " + gradle_project(root, files, scope) + ":test", "Gradle build file in " + scope
+    if at("pom.xml"):
+        mvn = "./mvnw" if "mvnw" in fs else "mvn"
+        how = "-pl" if "pom.xml" in fs else "-f"  # a module of the root build, or a build of its own
+        return "%s %s %s test" % (mvn, how, scope), "Maven pom in " + scope
+    if at("package.json"):
+        try:
+            scripts = json.loads(read_text(os.path.join(root, scope, "package.json"))).get("scripts") or {}
+        except (ValueError, AttributeError, OSError):
+            scripts = {}
+        if "test" in scripts:
+            return "npm --prefix " + scope + " test", "package.json in %s has a test script" % scope
+    if at("Cargo.toml"):
+        return "cargo test --manifest-path " + scope + "/Cargo.toml", "Cargo.toml in " + scope
+    if at("go.mod"):
+        return "go -C " + scope + " test ./...", "go.mod in " + scope
+    if "go.mod" in fs and any(f.startswith(scope + "/") and f.endswith("_test.go") for f in files):
+        return "go test ./" + scope + "/...", "Go tests in " + scope
+    py_tests = any(f.startswith(scope + "/") and re.search(r"(^|/)test_[^/]+\.py$", f) for f in files)
+    if py_tests or any(at(n) for n in ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "tox.ini")):
+        pytest = any(at(n) or n in fs for n in ("pytest.ini", "conftest.py")) or any(
+            "pytest" in (read_small_text(os.path.join(root, f)) or "")
+            for f in ("pyproject.toml", "setup.cfg", "tox.ini", scope + "/pyproject.toml") if f in fs)
+        if pytest:
+            return "python -m pytest " + scope, "Python tests in %s (pytest configured)" % scope
+        return "python -m unittest discover -s " + scope, "Python tests in %s (no pytest config)" % scope
+    if at("Makefile") and re.search(r"(?m)^test\s*:", read_small_text(os.path.join(root, scope, "Makefile")) or ""):
+        return "make -C " + scope + " test", "Makefile in %s has a test target" % scope
+    return None, None
+
+
+def live_test(st):
+    """(test, checked): `test(id, record)` says whether an item is still in its
+    doc. Checked against the Markdown file as it is now, or for a Google Doc
+    against the last sync and any pending diff of this run (`checked`)."""
+    p = pending_doc(st)
+    leaving = {r["id"] for r in p[2]["report"]["removed"]} if p else set()
+    path = st.config["doc"].get("path")
+    now = None
+    if st.config["doc"].get("type") == "markdown" and path and os.path.isfile(os.path.join(st.root, path)):
+        now = parse_doc(read_text(os.path.join(st.root, path)), st.status_title())
+    tags = {it["tag"] for it in now["items"] if it["tag"]} if now else set()
+    titles = {it["title_norm"] for it in now["items"]} if now else set()
+
+    def test(sid, rec):
+        if rec.get("state") == "removed" or "removed-from-doc" in rec.get("flags", []) or sid in leaving:
+            return False
+        return now is None or bool(sid in tags or rec.get("tag") in tags or rec.get("title_norm") in titles)
+    return test, "file" if now else "last sync"
+
+
+def find_overlap(project, doc):
+    """Items of the new doc that are already tracked in another doc, paired
+    the way `find_moves` will pair them at the sync: by tag, or by identical
+    text or similarity with an item that has left its doc. Items `live` in
+    their own doc pair only by tag or identical text: they stay where they
+    are unless the developer cuts them. The doc's title heading is left out."""
+    states = project.docs() if project.multi else [project.doc()]
+    now = dt.datetime.now(dt.timezone.utc)
+    title = next((it for it in doc["items"] if it["kind"] == "heading" and it["level"] == 1), None)
+    tracked = []  # (state, id, record, live, checked)
+    for st in states:
+        live, checked = live_test(st)
+        for sid, rec in st.items.items():
+            if rec.get("state") == "removed" and not rec.get("tag"):
+                age = (now - parse_iso(rec["removed_at"])).days if rec.get("removed_at") else 0
+                if age > RECENT_REMOVAL_DAYS:
+                    continue
+            tracked.append((st, sid, rec, live(sid, rec), checked))
+    pairs = []
+    for it in doc["items"]:
+        if not it["title_norm"] or it is title:
+            continue
+        for n, (st, sid, rec, live, _) in enumerate(tracked):
+            if it["tag"] and (it["tag"] == sid or it["tag"] == rec.get("tag")
+                              or it["tag"] in rec.get("aliases", [])):
+                pairs.append((0, 1.0, it, n, "tag"))
+            elif (it["kind"], it["title_norm"], it["body_norm"]) ==                     (rec.get("kind"), rec.get("title_norm"), rec.get("body_norm")):
+                pairs.append((1, 1.0, it, n, "exact"))
+            elif not live and difflib.SequenceMatcher(
+                    None, it["title_norm"], rec.get("title_norm") or "").quick_ratio() >= UNCERTAIN:
+                score = similarity(it, dict(rec, state="todo"), None, len(doc["items"]), max(len(st.items), 1))
+                if score >= UNCERTAIN:
+                    pairs.append((2, score, it, n, "similar"))
+    pairs.sort(key=lambda p: (p[0], -p[1]))
+    out, used_new, used_old = [], set(), set()
+    for rank, score, it, n, how in pairs:
+        if it["key"] in used_new or n in used_old:
+            continue
+        used_new.add(it["key"])
+        used_old.add(n)
+        st, sid, rec, live, checked = tracked[n]
+        out.append({"key": it["key"], "order": it["order"], "title": it["title"], "doc": st.name,
+                    "id": st.qid(sid), "tracked_title": rec.get("title"), "how": how, "score": round(score, 3),
+                    "state": rec.get("prev_state") if rec.get("state") == "removed" else rec.get("state"),
+                    "live": live, "checked": checked})
+    out.sort(key=lambda o: o["order"])
+    for o in out:
+        del o["order"]
+    return out
+
+
+def cmd_doc_suggest(args):
+    """Read a doc that isn't tracked yet and print a best guess at its
+    `doc add` settings (or `init`'s, without a .ddd/), plus what the developer
+    should confirm. Changes nothing."""
+    if not args.name:
+        raise DddError("usage: doc suggest PATH|URL [--file SAVED-TEXT]")
+    found = args.root or find_root(os.getcwd())
+    root = os.path.abspath(found or os.getcwd())
+    project = Project(root) if found and os.path.exists(os.path.join(root, STATE_DIR, "config.json")) else None
+    source = doc_source(root, args.name)
+    if args.file:
+        text = read_doc_input(args.file)
+    elif source["type"] == "markdown":
+        if not os.path.isfile(os.path.join(root, source["path"])):
+            raise DddError("no file at %s" % source["path"])
+        text = read_text(os.path.join(root, source["path"]))
+    else:
+        raise DddError("a Google Doc: fetch it through the connector, save it outside the repo, and pass "
+                       "--file <saved>")
+    status_title = (project.config.get("status_section") if project else None) or "DDD Status"
+    doc = parse_doc(text, status_title)
+    title = doc_title(doc)
+    files = project_files(root)
+    git_ok = git(root, "rev-parse", "--git-dir", check=False)[0] == 0
+    prefix = (project.config.get("branch_prefix") if project else None) or "ddd/"
+
+    tracked = {}
+    if project:
+        tracked = project.config["docs"] if project.multi else {None: project.config["doc"]}
+    already = next((n for n, od in tracked.items()
+                    if (od.get("id") and od.get("id") == source.get("id") and od.get("tab") == source.get("tab"))
+                    or (od.get("path") and od.get("path") == source.get("path"))), False)
+
+    scopes = scope_candidates(root, files, text, title, source)
+    scope = scopes[0]["path"] if scopes and scopes[0]["score"] >= 3 else None
+    test, test_why = scope_test_command(root, files, scope) if scope else (None, None)
+
+    taken = [n for n in tracked if n]
+    first = None
+    if project and not project.multi:
+        snap = os.path.join(project.dir, "snapshot.md")
+        old_title = doc_title(parse_doc(read_text(snap), status_title)) if os.path.exists(snap) else None
+        old = project.config["doc"]
+        opts = name_options(old_title, os.path.basename(old.get("path") or ""),
+                            os.path.dirname(old.get("path") or ""), os.path.basename(root)) + ["main"]
+        first = next((n for n in opts if not doc_name_problem(root, n, prefix)), None)
+        taken = [first] if first else []
+    base = os.path.basename(source["path"]) if source.get("path") else ""
+    opts = name_options(scope.rsplit("/", 1)[-1] if scope else "", title, base,
+                        os.path.dirname(source.get("path") or "").rsplit("/", 1)[-1])
+    names = [n for n in opts if not doc_name_problem(root, n, prefix, taken)]
+
+    overlap = find_overlap(project, doc) if project else []
+    live = [o for o in overlap if o["live"]]
+    markers = {m: sum(1 for it in doc["items"] if m in it["markers"]) for m in MARKERS}
+    lines = outline(doc)
+    questions = []
+    if already is not False:
+        questions.append("already tracked%s: nothing to add" % (" as " + already if already else ""))
+    else:
+        if project:
+            questions.append("doc name (suggested: %s)" % (names[0] if names else "none fits"))
+            if not project.multi:
+                questions.append("name for the existing doc (suggested: %s)" % (first or "none fits"))
+        questions.append("scope folder (suggested: %s)" % (scope or "none: the doc plans the whole repo"))
+        questions.append("test command (suggested: %s)" % (
+            test or (project.config.get("test_command") if project else None) or "none found"))
+        if live:
+            questions.append("%d item%s also still in another doc: moving or copying?"
+                             % (len(live), "" if len(live) == 1 else "s"))
+    emit({
+        "source": source,
+        "project": "multi" if project and project.multi else ("single" if project else "none"),
+        "already_tracked": already,
+        "title": title,
+        "items": len(doc["items"]),
+        "markers": markers,
+        "tags": sum(1 for it in doc["items"] if it["tag"]),
+        "has_status_section": doc["has_status_section"],
+        "warnings": doc["warnings"],
+        "outline": lines[:80],
+        "outline_truncated": max(len(lines) - 80, 0),
+        "name": {"suggested": names[0] if names else None, "alternatives": names[1:4]},
+        "first_name": first,
+        "scope": {"suggested": scope, "candidates": scopes},
+        "test_command": {"suggested": test, "why": test_why, "verified": False,
+                         "repo": project.config.get("test_command") if project else None},
+        "overlap": overlap,
+        "overlap_live": len(live),
+        "needs": sorted({ref for it in doc["items"] for ref in it.get("needs", [])}),
+        "git": {"repo": git_ok, "branch": current_branch(root) if git_ok else None},
+        "confirm": questions,
+    })
 
 
 def read_doc_input(path):
@@ -1375,7 +2111,8 @@ def doc_text_for(state, path):
     if cfg.get("type") == "markdown" and cfg.get("path"):
         return read_text(os.path.join(state.root, cfg["path"]))
     raise DddError("the doc is a Google Doc: fetch it through the MCP connector, save it to "
-                   ".ddd/tmp/doc.md, and pass that path")
+                   "%s/doc.md, and pass that path"
+                   % os.path.relpath(state.tmp_dir, state.root).replace("\\", "/"))
 
 
 def outline(doc):
@@ -1413,6 +2150,135 @@ def compare_docs(a, b):
             "differences": diffs, "only_in_first": only_a, "only_in_second": only_b}
 
 
+# --------------------------------------------------------------------------
+# several docs: moves between docs and Needs references (references/multi-doc.md)
+
+RECENT_REMOVAL_DAYS = 30
+
+
+def pending_doc(state):
+    """(pending, parsed doc, diff result) for a doc's pending diff, or None."""
+    pending = load_json(state.pending_path)
+    if not pending:
+        return None
+    doc = parse_doc(pending["text"], state.status_title())
+    return pending, doc, compute_diff(state.items, doc)
+
+
+def find_moves(project, forced=None, rejected=None):
+    """Items that moved from one doc to another, across every pending diff.
+
+    A new item in doc B is matched to an item leaving doc A (removed in A's
+    pending diff, or removed in an earlier sync): by tag or identical text
+    with confidence, by similarity as a proposal. A tag that is still live in
+    another doc is proposed too (that doc's own edit may not be synced yet).
+    `forced` {"B:key": "A:id"} are moves the developer confirmed; `rejected`
+    lists "B:key" that are new items. Returns a list of moves."""
+    forced, rejected = dict(forced or {}), set(rejected or [])
+    pend = {}
+    for st in project.docs():
+        p = pending_doc(st)
+        if p:
+            pend[st.name] = (st,) + p
+    now = dt.datetime.now(dt.timezone.utc)
+    leaving = {}  # (doc, id) -> "leaving" | "removed" | "live"
+    for st in project.docs():
+        going = {r["id"] for r in pend[st.name][3]["report"]["removed"]} if st.name in pend else set()
+        for iid, rec in st.items.items():
+            if iid in going or "removed-from-doc" in rec.get("flags", []):
+                leaving[(st.name, iid)] = "leaving"
+            elif rec.get("state") == "removed":
+                age = (now - parse_iso(rec["removed_at"])).days if rec.get("removed_at") else 0
+                leaving[(st.name, iid)] = "removed" if age <= RECENT_REMOVAL_DAYS else "old"
+            else:
+                leaving[(st.name, iid)] = "live"
+
+    pairs = []  # (rank, score, to, key, from_doc, from_id, how, confident)
+    for name, (st, pending, doc, result) in pend.items():
+        new_keys = {n["key"] for n in result["report"]["new"]}
+        for it in doc["items"]:
+            qkey = "%s:%s" % (name, it["key"])
+            if it["key"] not in new_keys or qkey in rejected:
+                continue
+            if qkey in forced:
+                sdoc, sid = forced[qkey].split(":", 1)
+                pairs.append((0, 1.0, name, it["key"], sdoc, project.doc(sdoc).resolve_id(sid), "confirmed", True))
+                continue
+            for src in project.docs():
+                if src.name == name:
+                    continue
+                for sid, rec in src.items.items():
+                    kind = leaving[(src.name, sid)]
+                    tagged = it["tag"] and (it["tag"] == sid or it["tag"] == rec.get("tag")
+                                            or it["tag"] in rec.get("aliases", []))
+                    if tagged:
+                        pairs.append((1, 1.0, name, it["key"], src.name, sid, "tag", kind != "live"))
+                    elif kind == "live":
+                        continue
+                    elif (it["kind"], it["title_norm"], it["body_norm"]) == \
+                            (rec.get("kind"), rec.get("title_norm"), rec.get("body_norm")) and it["title_norm"]:
+                        pairs.append((2, 1.0, name, it["key"], src.name, sid, "exact", True))
+                    elif kind in ("leaving", "removed") and it["title_norm"]:
+                        score = similarity(it, dict(rec, state="todo"), None,
+                                           len(doc["items"]), max(len(src.items), 1))
+                        if score >= UNCERTAIN:
+                            pairs.append((3, score, name, it["key"], src.name, sid, "similar", False))
+    pairs.sort(key=lambda p: (p[0], -p[1]))
+    moves, used_keys, used_src = [], set(), set()
+    for rank, score, to, key, sdoc, sid, how, confident in pairs:
+        if (to, key) in used_keys or (sdoc, sid) in used_src:
+            continue
+        used_keys.add((to, key))
+        used_src.add((sdoc, sid))
+        it = next(i for i in pend[to][2]["items"] if i["key"] == key)
+        rec = project.doc(sdoc).items[sid]
+        moves.append({"to": to, "key": key, "qkey": "%s:%s" % (to, key), "title": it["title"],
+                      "from": "%s:%s" % (sdoc, sid), "from_title": rec.get("title"),
+                      "state": rec.get("prev_state") if rec.get("state") == "removed" else rec.get("state"),
+                      "how": how, "score": round(score, 3), "confident": confident})
+    return moves
+
+
+def apply_moves_to_report(report, name, moves):
+    """Take confident moves out of a doc's new/removed lists and the questions
+    they would raise, and recompute needs_input."""
+    ins = {m["key"] for m in moves if m["to"] == name and m["confident"]}
+    outs = {m["from"].split(":", 1)[1] for m in moves if m["from"].split(":", 1)[0] == name and m["confident"]}
+    report["moved_in"] = [m for m in moves if m["to"] == name and m["confident"]]
+    report["moved_out"] = [m for m in moves if m["from"].split(":", 1)[0] == name and m["confident"]]
+    report["new"] = [n for n in report["new"] if n["key"] not in ins]
+    report["removed"] = [r for r in report["removed"] if r["id"] not in outs]
+    report["conflicts"] = [c for c in report["conflicts"] if c["id"] not in outs]
+    report["possible"] = [p for p in report["possible"] if p["id"] not in outs and p["key"] not in ins]
+    report["splits"] = [s for s in report["splits"] if s["from_id"] not in outs and s["key"] not in ins]
+    report["summary"].update(new=len(report["new"]), removed=len(report["removed"]),
+                             conflicts=len(report["conflicts"]), moved_in=len(report["moved_in"]),
+                             moved_out=len(report["moved_out"]))
+    report["needs_input"] = bool(report["proposed"] or report["possible"] or report["splits"]
+                                 or report["conflicts"]) and not report["first_sync"]
+    return report
+
+
+def needs_warnings(state, doc):
+    """Warnings for Needs references that match no item."""
+    tags = {it["tag"] for it in doc["items"] if it["tag"]}
+    out = []
+    for it in doc["items"]:
+        for ref in it.get("needs", []):
+            if ":" in ref:
+                dname, iid = ref.split(":", 1)
+                ok = state.project.multi and dname in state.project.config["docs"] and (
+                    (dname == state.name and (iid in tags or state.find_id(iid)))
+                    or (dname != state.name and state.project.doc(dname).find_id(iid)))
+            else:
+                ok = ref in tags or bool(state.find_id(ref))
+            if not ok:
+                out.append("line %d: Needs {#%s} matches no item%s" % (
+                    it["line"], ref, "" if state.project.multi or ":" not in ref
+                    else " (this project has one doc; `doc:tag` references need several)"))
+    return out
+
+
 def cmd_parse(args):
     st = State(args.root) if args.root else None
     title = st.status_title() if st else "DDD Status"
@@ -1426,9 +2292,40 @@ def cmd_parse(args):
         emit(doc)
 
 
+def waiting_for(st):
+    """Items this doc's first sync waits for to leave their own docs (`doc add
+    --wait-for`): a section copied into the new doc moves, with its state,
+    only if the sync sees it leave the old doc. Clears the wait once they all
+    have."""
+    doc = st.project.config["docs"][st.name] if st.name else {}
+    wait = doc.get("wait_for") or []
+    tests, still = {}, []
+    for q in wait:
+        try:
+            other, sid = st.project.resolve_item(q)
+        except DddError:
+            continue
+        if other is st:
+            continue
+        if other.name not in tests:
+            tests[other.name] = live_test(other)[0]
+        if tests[other.name](sid, other.items[sid]):
+            still.append({"id": other.qid(sid), "title": other.items[sid].get("title")})
+    if wait and not still:
+        doc.pop("wait_for")
+        st.project.save_config()
+        st.log({"type": "doc-wait-done", "items": wait})
+    return still
+
+
 def cmd_diff(args):
     st = load_state(args)
     version = args.doc_version
+    held = waiting_for(st)
+    if held:
+        emit({"doc": st.name, "held": True, "waiting_for": held, "fetch_skipped": True, "fetch_needed": False,
+              "doc_unchanged": True, "needs_input": False})
+        return
     if version and not args.file and st.config["doc"].get("type") == "gdoc":
         # Cheap check before fetching a Google Doc: same version, same text.
         pending = load_json(st.pending_path)
@@ -1442,6 +2339,7 @@ def cmd_diff(args):
     doc = parse_doc(text, st.status_title())
     result = compute_diff(st.items, doc)
     report = result["report"]
+    report["warnings"] += needs_warnings(st, doc)
     report["doc_hash"] = doc["hash"]
     report["previous_doc_hash"] = st.data.get("doc_hash")
     report["doc_unchanged"] = doc["hash"] == st.data.get("doc_hash")
@@ -1451,6 +2349,16 @@ def cmd_diff(args):
     if version and report["doc_unchanged"]:
         st.data["doc_version"] = version  # nothing to accept; remember the version now
         st.save()
+    if st.name:
+        # Moves between docs are judged across every pending diff, so the
+        # last doc diffed in a run reports the full set.
+        moves = find_moves(st.project)
+        apply_moves_to_report(report, st.name, moves)
+        proposed = [m for m in moves if not m["confident"]]
+        report["doc"] = st.name
+        report["joint"] = {"pending": [d.name for d in st.project.docs() if os.path.exists(d.pending_path)],
+                           "moves": [m for m in moves if m["confident"]], "proposed_moves": proposed}
+        report["needs_input"] = report["needs_input"] or bool(proposed)
     emit(report)
 
 
@@ -1465,7 +2373,12 @@ def parse_pairs(values, sep="="):
 
 
 def cmd_accept(args):
-    st = load_state(args)
+    project = load_project(args)
+    if project.multi:
+        return accept_docs(args, project)
+    st = project.doc()
+    if args.move or args.no_move:
+        raise DddError("--move and --no-move need several docs")
     pending = load_json(st.pending_path)
     if not pending:
         raise DddError("no pending diff; run `ddd.py diff` first")
@@ -1497,34 +2410,173 @@ def cmd_accept(args):
           "ids": key_to_id, "conflicts": report["conflicts"]})
 
 
+def accept_docs(args, project):
+    """Apply every pending diff of a multi-doc project in one step, so items
+    that moved between docs keep their state, branch and history."""
+    pend = {}
+    for st in project.docs():
+        p = pending_doc(st)
+        if p:
+            pend[st.name] = (st,) + p
+    if not pend:
+        raise DddError("no pending diff; run `ddd.py diff --doc NAME` first")
+
+    def split_key(value, what):
+        if ":" in value:
+            d, k = value.split(":", 1)
+            if d not in pend:
+                raise DddError("%s %s: doc %s has no pending diff" % (what, value, d))
+            return d, k
+        if len(pend) == 1:
+            return next(iter(pend)), value
+        raise DddError("%s %s: qualify keys as DOC:KEY when several docs have pending diffs" % (what, value))
+
+    forced_moves = {}
+    for qkey, src in parse_pairs(args.move):
+        d, k = split_key(qkey, "--move")
+        if ":" not in src:
+            raise DddError("--move %s=%s: the source is DOC:ID" % (qkey, src))
+        forced_moves["%s:%s" % (d, k)] = src
+    rejected = {"%s:%s" % split_key(k, "--no-move") for k in args.no_move or []}
+    moves = find_moves(project, forced_moves, rejected)
+    unresolved_moves = [m for m in moves if not m["confident"] and not args.accept_proposed]
+    if unresolved_moves:
+        raise DddError("possible moves between docs need a decision: --move DOC:KEY=DOC:ID to confirm, "
+                       "--no-move DOC:KEY to keep it new, or --accept-proposed", code=2,
+                       proposed_moves=unresolved_moves)
+    if args.doc_name:
+        other = [m for m in moves if args.doc_name in (m["to"], m["from"].split(":", 1)[0])]
+        if other or len(pend) > 1:
+            raise DddError("accept every doc together (omit --doc): pending diffs in %s%s"
+                           % (", ".join(pend), "; items move between docs" if other else ""))
+
+    plans = {}
+    for name, (st, pending, doc, _) in pend.items():
+        forced, force_new, splits, merges = {}, set(), {}, []
+        for qkey, iid in parse_pairs(args.match):
+            d, k = split_key(qkey, "--match")
+            if d == name:
+                forced[k] = st.resolve_id(iid.split(":", 1)[1] if iid.startswith(name + ":") else iid)
+        for v in args.new or []:
+            d, k = split_key(v, "--new")
+            if d == name:
+                force_new.add(k)
+        for old, keys in parse_pairs(args.split):
+            d, _ = split_key(keys.split(",")[0].strip(), "--split")
+            if d == name:
+                oid = st.resolve_id(old.split(":", 1)[1] if old.startswith(name + ":") else old)
+                splits[oid] = [split_key(k.strip(), "--split")[1] for k in keys.split(",") if k.strip()]
+                force_new.update(splits[oid])
+        for olds, key in parse_pairs(args.merge):
+            d, k = split_key(key, "--merge")
+            if d == name:
+                ids = [st.resolve_id(o.strip().split(":", 1)[1] if o.strip().startswith(name + ":") else o.strip())
+                       for o in olds.split(",") if o.strip()]
+                merges.append((ids, k))
+                forced.setdefault(k, ids[0])
+        ins = {m["key"]: m["from"] for m in moves if m["to"] == name}
+        force_new.update(ins)
+        result = compute_diff(st.items, doc, forced=forced, force_new=force_new)
+        unresolved = [p for p in result["report"]["proposed"] if p["key"] not in forced]
+        if unresolved and not args.accept_proposed:
+            raise DddError("uncertain matches in doc %s need a decision: pass --match %s:KEY=ID to confirm, "
+                           "--new %s:KEY to reject, or --accept-proposed" % (name, name, name), code=2,
+                           doc=name, proposed=unresolved)
+        plans[name] = (st, pending, doc, result, splits, merges, ins)
+
+    # Copy moved records before any doc changes, apply every diff, then drop
+    # the records from the docs they left.
+    outs = {}
+    for m in moves:
+        sdoc, sid = m["from"].split(":", 1)
+        outs.setdefault(sdoc, set()).add(sid)
+    out = {"ok": True, "docs": {}, "moves": moves}
+    for name, (st, pending, doc, result, splits, merges, ins) in plans.items():
+        imports = {}
+        for key, src in ins.items():
+            sdoc, sid = src.split(":", 1)
+            rec = json.loads(json.dumps(project.doc(sdoc).items[sid]))
+            if project.config["docs"][sdoc].get("legacy_trailers"):
+                # commits made before the project had several docs carry bare ids
+                rec["old_trailers"] = rec.get("old_trailers", []) + [sid] + rec.get("aliases", [])
+            imports[key] = (src, rec)
+        plans[name] = plans[name] + (imports,)
+    for name, (st, pending, doc, result, splits, merges, ins, imports) in plans.items():
+        report = apply_moves_to_report(result["report"], name, moves)
+        key_to_id = apply_diff(st, doc, result, pending["text"], splits=splits, merges=merges,
+                               imports=imports, moved_out=outs.get(name))
+        if pending.get("doc_version"):
+            st.data["doc_version"] = pending["doc_version"]
+            st.save()
+        os.remove(st.pending_path)
+        out["docs"][name] = {"doc_hash": doc["hash"], "summary": report["summary"],
+                             "ids": key_to_id, "conflicts": report["conflicts"]}
+    for sdoc, sids in outs.items():
+        st = project.doc(sdoc)
+        for sid in sids:
+            st.items.pop(sid, None)
+        st.data["items"] = st.items
+        st.save()
+    emit(out)
+
+
+def selected_docs(args):
+    """The docs a reporting command covers: --doc, else all of them."""
+    project = load_project(args)
+    if getattr(args, "doc_name", None):
+        return [project.resolve_doc(args.doc_name)]
+    return project.docs()
+
+
 def cmd_rank(args):
-    st = load_state(args)
-    cands, blocked = candidates(st, queued_only=args.queued)
+    docs = selected_docs(args)
+    cands, blocked, waiting = [], [], []
+    for i, st in enumerate(docs):
+        c, b, w = candidates(st, queued_only=args.queued)
+        for x in c:
+            x["_doc"] = i
+        cands += c
+        blocked += b
+        waiting += w
+    if args.queued:  # docs in config order, then doc order
+        cands.sort(key=lambda c: (not c["signals"]["resume"], c["_doc"], c["order"]))
+    else:
+        cands.sort(key=lambda c: (-c["score"], c["_doc"], c["order"]))
+    for c in cands:
+        c.pop("_doc")
     emit({"candidates": cands[: args.limit] if args.limit else cands, "blocked": blocked,
-          "total": len(cands)})
+          "waiting": waiting, "total": len(cands)})
 
 
 def cmd_items(args):
-    st = load_state(args)
     rows = []
-    for iid, r in sorted(st.items.items(), key=lambda kv: kv[1].get("order", 0)):
-        if args.state and r.get("state") not in args.state:
-            continue
-        rows.append({"id": iid, "title": r.get("title"), "kind": r.get("kind"), "state": r.get("state"),
-                     "markers": sorted(effective(r)), "branch": r.get("branch"),
-                     "flags": r.get("flags", []), "parent": r.get("parent")})
+    for st in selected_docs(args):
+        for iid, r in sorted(st.items.items(), key=lambda kv: kv[1].get("order", 0)):
+            if args.state and r.get("state") not in args.state:
+                continue
+            row = {"id": st.qid(iid), "title": r.get("title"), "kind": r.get("kind"), "state": r.get("state"),
+                   "markers": sorted(effective(r)), "branch": r.get("branch"),
+                   "flags": r.get("flags", []), "parent": r.get("parent")}
+            if r.get("needs"):
+                row["needs"] = r["needs"]
+            rows.append(row)
     emit({"items": rows})
 
 
 def cmd_show(args):
-    st = load_state(args)
-    iid = st.resolve_id(args.id)
-    emit(st.items[iid])
+    st, iid = load_item(args)
+    rec = dict(st.items[iid])
+    if st.name:
+        rec["doc"] = st.name
+        rec["qid"] = st.qid(iid)
+    if rec.get("needs"):
+        open_needs, stack_on, unresolved = needs_status(st, rec)
+        rec["needs_status"] = {"open": open_needs, "stack_on": stack_on, "unresolved": unresolved}
+    emit(rec)
 
 
 def cmd_set(args):
-    st = load_state(args)
-    iid = st.resolve_id(args.id)
+    st, iid = load_item(args)
     rec = st.items[iid]
     old = rec.get("state")
     if args.state:
@@ -1564,8 +2616,7 @@ def cmd_set(args):
 
 
 def cmd_start(args):
-    st = load_state(args)
-    iid = st.resolve_id(args.id)
+    st, iid = load_item(args)
     rec = st.items[iid]
     if rec.get("state") in ("done", "removed"):
         raise DddError("item %s is %s" % (iid, rec.get("state")))
@@ -1584,19 +2635,28 @@ def cmd_start(args):
     rec.setdefault("started", now_iso())
     st.save()
     st.log({"type": "state", "item": iid, "to": "in-progress", "branch": branch})
-    emit({"ok": True, "id": iid, "branch": branch, "title": rec.get("title"),
-          "body": rec.get("body"), "acceptance": rec.get("acceptance", []),
-          "test_command": st.config.get("test_command"),
-          "commit_trailer": "%s: %s" % (TRAILER, iid)})
+    out = {"ok": True, "id": st.qid(iid), "branch": branch, "title": rec.get("title"),
+           "body": rec.get("body"), "acceptance": rec.get("acceptance", []),
+           "test_command": st.config.get("test_command"), "commit_trailer": st.trailer(iid)}
+    if st.name:
+        out["doc"] = st.name
+    open_needs, stack_on, _ = needs_status(st, rec)
+    if open_needs:
+        out["needs_open"] = open_needs
+        hint = ""
+        if stack_on and not args.from_branch:
+            hint = "; it can build on %s with `start --from %s`" % (stack_on, stack_on)
+        out["warnings"] = ["%s needs %s, which is not done%s"
+                           % (st.qid(iid), ", ".join(n["id"] for n in open_needs), hint)]
+    emit(out)
 
 
 def cmd_commit(args):
-    st = load_state(args)
-    iid = st.resolve_id(args.id)
+    st, iid = load_item(args)
     branch = st.items[iid].get("branch")
     if branch and current_branch(st) != branch:
         raise DddError("on %s, but %s is built on %s; run `ddd.py start %s`"
-                       % (current_branch(st), iid, branch, iid))
+                       % (current_branch(st), st.qid(iid), branch, st.qid(iid)))
     code, staged = git(st, "diff", "--cached", "--name-only")
     files = [f for f in staged.splitlines() if f.strip()]
     if any(f == STATE_DIR or f.startswith(STATE_DIR + "/") for f in files):
@@ -1607,7 +2667,7 @@ def cmd_commit(args):
     argv = ["commit"]
     for m in args.message:
         argv += ["-m", m]
-    argv += ["-m", "%s: %s" % (TRAILER, iid)]
+    argv += ["-m", st.trailer(iid)]
     git(st, *argv)
     _, sha = git(st, "rev-parse", "HEAD")
     rec = st.items[iid]
@@ -1617,9 +2677,12 @@ def cmd_commit(args):
     emit({"ok": True, "commit": sha, "files": files})
 
 
+def trailer_grep(names):
+    return "^%s: (%s)$" % (TRAILER, "|".join(re.escape(n) for n in names))
+
+
 def cmd_finish(args):
-    st = load_state(args)
-    iid = st.resolve_id(args.id)
+    st, iid = load_item(args)
     rec = st.items[iid]
     branch = rec.get("branch")
     if not branch:
@@ -1635,11 +2698,11 @@ def cmd_finish(args):
     # (`start --from`) also contains the parent's commits, and recording those
     # would mark this item merged as soon as the parent is.
     _, out = git(st, "log", "--format=%H", "--extended-regexp",
-                 "--grep", "^%s: %s$" % (TRAILER, re.escape(iid)), "%s..%s" % (base, branch), check=False)
+                 "--grep", trailer_grep(st.trailer_names(iid)), "%s..%s" % (base, branch), check=False)
     commits = [c for c in out.splitlines() if c.strip()]
     if not commits:
-        raise DddError("branch %s has no commits with the trailer `%s: %s` beyond %s; commit with "
-                       "`ddd.py commit %s`" % (branch, TRAILER, iid, base, iid))
+        raise DddError("branch %s has no commits with the trailer `%s` beyond %s; commit with "
+                       "`ddd.py commit %s`" % (branch, st.trailer(iid), base, st.qid(iid)))
     for c in commits:
         if c not in rec.setdefault("commits", []):
             rec["commits"].append(c)
@@ -1656,51 +2719,51 @@ def cmd_finish(args):
     untracked = untracked_files(st) if current_branch(st) == branch else []
     if not args.stay:
         checkout(st, base)
-    emit({"ok": True, "id": iid, "branch": branch, "commits": commits,
+    emit({"ok": True, "id": st.qid(iid), "branch": branch, "commits": commits,
           "now_on": current_branch(st), "untracked": untracked})
 
 
 def cmd_checkout(args):
-    st = load_state(args)
+    st = load_project(args)
     checkout(st, args.branch)
     emit({"ok": True, "now_on": current_branch(st)})
 
 
 def cmd_sync_git(args):
-    st = load_state(args)
-    base = base_branch(st)
+    project = load_project(args)
+    base = base_branch(project)
     merged = []
-    for iid, rec in st.items.items():
-        if rec.get("state") != "awaiting-review":
-            continue
-        hit = None
-        for c in rec.get("commits", []):
-            code, _ = git(st, "merge-base", "--is-ancestor", c, base, check=False)
-            if code == 0:
-                hit = "merged"
-                break
-        if not hit:
-            names = [iid] + rec.get("aliases", [])
-            for n in names:
+    for st in project.docs():
+        changed = False
+        for iid, rec in st.items.items():
+            if rec.get("state") != "awaiting-review":
+                continue
+            hit = None
+            for c in rec.get("commits", []):
+                code, _ = git(st, "merge-base", "--is-ancestor", c, base, check=False)
+                if code == 0:
+                    hit = "merged"
+                    break
+            if not hit:
                 _, out = git(st, "log", base, "--format=%H", "--extended-regexp",
-                             "--grep", "^%s: %s$" % (TRAILER, re.escape(n)), check=False)
+                             "--grep", trailer_grep(st.trailer_names(iid)), check=False)
                 if out.strip():
                     hit = "squash-merged"
-                    break
-        if hit:
-            rec["state"] = "done"
-            rec["done_at"] = now_iso()
-            rec["done_by"] = "merge"
-            merged.append({"id": iid, "title": rec.get("title"), "how": hit})
-            st.log({"type": "state", "item": iid, "from": "awaiting-review", "to": "done", "how": hit})
-    if merged:
-        st.save()
+            if hit:
+                rec["state"] = "done"
+                rec["done_at"] = now_iso()
+                rec["done_by"] = "merge"
+                changed = True
+                merged.append({"id": st.qid(iid), "title": rec.get("title"), "how": hit})
+                st.log({"type": "state", "item": iid, "from": "awaiting-review", "to": "done", "how": hit})
+        if changed:
+            st.save()
     emit({"ok": True, "merged": merged})
 
 
 def cmd_status_block(args):
     st = load_state(args)
-    saved = os.path.join(st.root, STATE_DIR, "tmp", "gdoc-status.json")
+    saved = os.path.join(st.tmp_dir, "gdoc-status.json")
     tab = args.tab or st.config["doc"].get("tab")
     if args.gdoc_check:
         written = load_json(saved)
@@ -1716,6 +2779,7 @@ def cmd_status_block(args):
     block = render_status(st)
     if args.gdoc_read:
         out = gdoc_status_requests(load_gdoc_json(args.gdoc_read), block, st.status_title(), tab)
+        os.makedirs(st.tmp_dir, exist_ok=True)
         save_json(saved, {"tabId": out["tabId"], "expected": out["expected"]})
         out["block"] = block
         emit(out)
@@ -1724,6 +2788,9 @@ def cmd_status_block(args):
         emit({"block": block, "title": st.status_title()})
         return
     path = args.write
+    doc_path = st.config["doc"].get("path")
+    if st.name and doc_path and os.path.abspath(path) != os.path.abspath(os.path.join(st.root, doc_path)):
+        raise DddError("doc %s is %s, not %s; pass --doc to pick the doc" % (st.name, doc_path, path))
     text = read_text(path)
     current = doc_hash(text, st.status_title())
     expected = args.expect_hash or st.data.get("doc_hash")
@@ -1739,7 +2806,7 @@ def cmd_status_block(args):
 
 
 def cmd_commit_state(args):
-    st = load_state(args)
+    st = load_project(args)
     base = base_branch(st)
     if current_branch(st) != base:
         raise DddError("ddd state is committed only on the base branch (%s); you are on %s. "
@@ -1756,9 +2823,14 @@ def cmd_commit_state(args):
 
 
 def cmd_config(args):
-    st = load_state(args)
+    """Get or set config. With several docs, --doc reads the doc's merged
+    config and sets its own settings (test_command, branch_prefix,
+    status_section, doc.*); without --doc, the repo-wide config."""
+    project = load_project(args)
+    name = getattr(args, "doc_name", None)
+    st = project.resolve_doc(name) if name else None
     if args.action == "get":
-        node = st.config
+        node = st.config if st else project.config
         for part in (args.key.split(".") if args.key else []):
             node = node.get(part) if isinstance(node, dict) else None
         emit({"key": args.key, "value": node})
@@ -1769,29 +2841,46 @@ def cmd_config(args):
         value = json.loads(args.value)
     except ValueError:
         value = args.value
-    node = st.config
     parts = args.key.split(".")
+    if project.multi and st:
+        if parts[0] == "doc":
+            parts = parts[1:]
+        elif parts[0] not in DOC_SETTINGS:
+            raise DddError("%s is repo-wide; set it without --doc (per-doc settings: %s, doc.*)"
+                           % (args.key, ", ".join(DOC_SETTINGS)))
+        if not parts:
+            raise DddError("usage: config set doc.FIELD VALUE --doc NAME")
+        node = project.config["docs"][st.name]
+    else:
+        if project.multi and parts[0] in ("doc", "docs", "doc_order"):
+            raise DddError("%s belongs to one doc; pass --doc NAME (or use `ddd.py doc`)" % args.key)
+        node = project.config
     for part in parts[:-1]:
         node = node.setdefault(part, {})
     node[parts[-1]] = value
-    st.save_config()
-    st.log({"type": "config", "key": args.key, "value": value})
+    project.save_config()
+    (st or project).log({"type": "config", "key": args.key, "value": value})
     warnings = []
     if args.key == "test_command" and isinstance(value, str):
-        warnings = test_command_warnings(st.root, value)
+        warnings = test_command_warnings(project.root, value)
     emit({"ok": True, "key": args.key, "value": value, "warnings": warnings})
 
 
 def cmd_log(args):
-    st = load_state(args)
+    project = load_project(args)
     rows = []
-    if os.path.exists(st.log_path):
-        with open(st.log_path, "r", encoding="utf-8") as f:
+    want_doc, want_item = getattr(args, "doc_name", None), args.item
+    if want_item and ":" in want_item:
+        want_doc, want_item = want_item.split(":", 1)
+    if os.path.exists(project.log_path):
+        with open(project.log_path, "r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                if args.item and row.get("item") != args.item and args.item not in (row.get("items") or []):
+                if want_doc and row.get("doc", want_doc) != want_doc:
+                    continue
+                if want_item and row.get("item") != want_item and want_item not in (row.get("items") or []):
                     continue
                 rows.append(row)
     emit({"entries": rows[-args.limit:] if args.limit else rows})
@@ -1872,14 +2961,65 @@ def survey_git(root):
     return info
 
 
+def related_items(root, scope):
+    """Tracked items that are about `scope`: they name its path, or its folder
+    name in their title or body. A doc planned for that folder should carry
+    them over (references/multi-doc.md, "A new doc for part of the project")."""
+    if not os.path.exists(os.path.join(root, STATE_DIR, "config.json")):
+        return []
+    project = Project(root)
+    words = set(name_words(scope.rsplit("/", 1)[-1]))
+    out = []
+    for st in (project.docs() if project.multi else [project.doc()]):
+        if (st.config["doc"].get("scope") or "").strip("/") == scope:
+            continue  # the folder's own doc
+        hits = set()
+        for sid, rec in sorted(st.items.items(), key=lambda kv: kv[1].get("order", 0)):
+            if rec.get("state") == "removed":
+                continue
+            title, body = rec.get("title") or "", rec.get("body") or ""
+            text = (title + "\n" + body).lower()
+            why = [w for w, hit in (("path", scope.lower() + "/" in text or ("/" in scope and scope.lower() in text)),
+                                    ("title", bool(words & set(name_words(title)))),
+                                    ("body", bool(words & set(name_words(body))))) if hit]
+            if rec.get("parent") in hits:
+                why.append("in section")  # the rest of a section about the scope comes along
+            if why:
+                hits.add(sid)
+                out.append({"id": st.qid(sid), "doc": st.name, "title": rec.get("title"), "kind": rec.get("kind"),
+                            "parent": st.qid(rec["parent"]) if rec.get("parent") else None,
+                            "line": rec.get("line"), "tag": rec.get("tag"), "state": rec.get("state"), "why": why})
+    return out
+
+
+def survey_scope_git(root, scope):
+    if git(root, "rev-parse", "--git-dir", check=False)[0] != 0:
+        return {"repo": False}
+    _, count = git(root, "rev-list", "--count", "HEAD", "--", scope, check=False)
+    _, recent = git(root, "log", "-15", "--format=%cs %s", "--", scope, check=False)
+    _, unmerged = git(root, "branch", "--no-merged", "HEAD", "--format=%(refname:short)", check=False)
+    touching = [b for b in unmerged.splitlines() if b.strip()
+                and git(root, "log", "-1", "--format=%h", "HEAD.." + b.strip(), "--", scope, check=False)[1]]
+    return {"commits": int(count) if count.isdigit() else 0, "recent": recent.splitlines(),
+            "unmerged_branches": touching}
+
+
 def cmd_survey(args):
     root = os.path.abspath(args.root or os.getcwd())
-    files = project_files(root)
+    files = all_files = project_files(root)
+    scope = None
+    if args.scope:
+        scope = os.path.relpath(os.path.abspath(os.path.join(root, args.scope)), root).replace("\\", "/")
+        if scope.startswith("..") or scope == "." or not os.path.isdir(os.path.join(root, scope)):
+            raise DddError("--scope must be a folder inside the project: %s" % args.scope)
+        files = [f for f in all_files if f.startswith(scope + "/")]
+    inner = (lambda f: f[len(scope) + 1:]) if scope else (lambda f: f)  # noqa: E731
     exts, top = {}, {}
     for f in files:
         ext = os.path.splitext(f)[1].lower() or os.path.basename(f)
         exts[ext] = exts.get(ext, 0) + 1
-        head = f.split("/")[0] + ("/" if "/" in f else "")
+        rel = inner(f)
+        head = (scope + "/" if scope else "") + rel.split("/")[0] + ("/" if "/" in rel else "")
         top[head] = top.get(head, 0) + 1
     base = lambda f: f.rsplit("/", 1)[-1]  # noqa: E731
     docs = sorted((f for f in files if f.lower().endswith((".md", ".rst", ".txt", ".adoc"))),
@@ -1897,30 +3037,43 @@ def cmd_survey(args):
                     markers.append({"path": f, "line": n, "tag": m.group(1),
                                     "text": m.group(2).strip()[:160]})
     scripts = None
-    if "package.json" in files:
+    package = (scope + "/" if scope else "") + "package.json"
+    if package in files:
         try:
-            scripts = sorted((json.loads(read_text(os.path.join(root, "package.json"))).get("scripts") or {}))
+            scripts = sorted((json.loads(read_text(os.path.join(root, package))).get("scripts") or {}))
         except (ValueError, AttributeError):
             scripts = None
     tests = [f for f in files if TEST_PATH.search(f)]
-    emit({
+    extra = {}
+    if scope:
+        test, why = scope_test_command(root, all_files, scope)
+        extra["scope"] = {"path": scope, "test_command": {"suggested": test, "why": why},
+                          "git": survey_scope_git(root, scope), "related_items": related_items(root, scope)}
+    emit(dict({
         "root": root,
-        "name": os.path.basename(root),
+        "name": scope.rsplit("/", 1)[-1] if scope else os.path.basename(root),
         "ddd_initialised": os.path.exists(os.path.join(root, STATE_DIR, "config.json")),
         "git": survey_git(root),
         "files": len(files),
         "extensions": dict(sorted(exts.items(), key=lambda kv: -kv[1])[:15]),
         "top_level": dict(sorted(top.items())),
-        "manifests": [f for f in files if base(f) in MANIFESTS and f.count("/") <= 2]
-                     + [f for f in files if f.endswith((".csproj", ".sln")) and f.count("/") <= 2],
+        "manifests": [f for f in files if base(f) in MANIFESTS and inner(f).count("/") <= 2]
+                     + [f for f in files if f.endswith((".csproj", ".sln")) and inner(f).count("/") <= 2],
         "package_scripts": scripts,
         "tests": {"files": len(tests), "sample": tests[:20]},
-        "ci": [f for f in files if any(re.search(p, f) for p in CI_PATTERNS)],
-        "readme": [f for f in files if base(f).lower().startswith("readme") and f.count("/") <= 1],
+        "ci": [f for f in all_files if any(re.search(p, f) for p in CI_PATTERNS)],
+        "readme": [f for f in files if base(f).lower().startswith("readme") and inner(f).count("/") <= 1],
         "docs": docs[:30],
         "plan_candidates": [f for f in docs if PLAN_NAME.search(base(f))],
         "code_markers": {"total": total, "items": markers},
-    })
+    }, **extra))
+
+
+DOC_HELP = "with several docs: the doc to use (default: the only doc, or the doc whose scope holds the cwd)"
+
+
+def add_doc_option(s, help_text=DOC_HELP):
+    s.add_argument("--doc", dest="doc_name", metavar="NAME", help=help_text)
 
 
 def build_parser():
@@ -1936,7 +3089,24 @@ def build_parser():
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("info", help="config, counts, git status")
+    add_doc_option(s, "with several docs: only this doc (default: all)")
     s.set_defaults(func=cmd_info)
+
+    s = sub.add_parser("doc", help="several docs: suggest (best-guess settings for a doc, no changes), add "
+                                   "(the first add names the existing doc), list, rename, remove")
+    s.add_argument("action", choices=("suggest", "add", "list", "rename", "remove"))
+    s.add_argument("name", nargs="?", help="doc name (rename: the old name; suggest: the Markdown path or "
+                                           "Google Docs URL)")
+    s.add_argument("source", nargs="?", help="add: Markdown path or Google Docs URL; rename: the new name")
+    s.add_argument("--file", help="suggest: the doc's text, fetched and saved (needed for a Google Doc)")
+    s.add_argument("--scope", help="add: folder whose work this doc plans (picks the doc by cwd)")
+    s.add_argument("--test", help="add: the doc's own test command (default: the repo's)")
+    s.add_argument("--first-name", help="add, single-doc project: the name for the existing doc")
+    s.add_argument("--wait-for", action="append", metavar="ID",
+                   help="add: hold the new doc's first sync until this item (copied into it) has left its "
+                        "own doc, so it moves with its state; repeatable")
+    s.add_argument("--force", action="store_true", help="remove: even with active items")
+    s.set_defaults(func=cmd_doc)
 
     s = sub.add_parser("parse", help="parse a doc and print its items (no state needed)")
     s.add_argument("file", help="Markdown, a .b64 file, or a saved connector result (JSON)")
@@ -1946,6 +3116,8 @@ def build_parser():
 
     s = sub.add_parser("survey", help="facts about the project for drafting a plan (no state needed)")
     s.add_argument("--limit", type=int, default=200, help="max code markers (TODO, FIXME, ...) listed")
+    s.add_argument("--scope", metavar="DIR", help="only this folder (a new doc for part of the project); adds "
+                   "its test command, git history and the tracked items about it")
     s.set_defaults(func=cmd_survey)
 
     s = sub.add_parser("diff", help="compare the doc with the last sync")
@@ -1953,6 +3125,7 @@ def build_parser():
                    "saved connector result")
     s.add_argument("--doc-version", help="the doc's modified time or revision id; without FILE, "
                    "reports whether a fetch is needed")
+    add_doc_option(s)
     s.set_defaults(func=cmd_diff)
 
     s = sub.add_parser("accept", help="apply the pending diff")
@@ -1960,20 +3133,27 @@ def build_parser():
     s.add_argument("--new", action="append", metavar="KEY", help="treat a doc item as new")
     s.add_argument("--split", action="append", metavar="ID=KEY,KEY", help="an item was split")
     s.add_argument("--merge", action="append", metavar="ID,ID=KEY", help="items were merged")
-    s.add_argument("--accept-proposed", action="store_true", help="accept every uncertain match")
+    s.add_argument("--accept-proposed", action="store_true", help="accept every uncertain match (and move)")
+    s.add_argument("--move", action="append", metavar="DOC:KEY=DOC:ID",
+                   help="several docs: the item at KEY moved here from another doc")
+    s.add_argument("--no-move", action="append", metavar="DOC:KEY", help="several docs: KEY is a new item")
+    add_doc_option(s, "several docs: accept only this doc (refused when items move between docs)")
     s.set_defaults(func=cmd_accept)
 
     s = sub.add_parser("rank", help="ranked work candidates")
     s.add_argument("--queued", action="store_true", help="only [next] items, in doc order (auto mode)")
     s.add_argument("--limit", type=int, default=10)
+    add_doc_option(s, "with several docs: only this doc (default: all)")
     s.set_defaults(func=cmd_rank)
 
     s = sub.add_parser("items", help="list tracked items")
     s.add_argument("--state", action="append", choices=STATES)
+    add_doc_option(s, "with several docs: only this doc (default: all)")
     s.set_defaults(func=cmd_items)
 
     s = sub.add_parser("show", help="full record for one item")
     s.add_argument("id")
+    add_doc_option(s)
     s.set_defaults(func=cmd_show)
 
     s = sub.add_parser("set", help="update an item's state or metadata")
@@ -1986,16 +3166,19 @@ def build_parser():
     s.add_argument("--comment-id")
     s.add_argument("--comment-kind", default="status", choices=("status", "question"))
     s.add_argument("--clear-flags", action="store_true")
+    add_doc_option(s)
     s.set_defaults(func=cmd_set)
 
     s = sub.add_parser("start", help="check out the item's branch and mark it in-progress")
     s.add_argument("id")
     s.add_argument("--from", dest="from_branch", help="branch to fork from (default: base)")
+    add_doc_option(s)
     s.set_defaults(func=cmd_start)
 
     s = sub.add_parser("commit", help="commit staged changes with the item trailer")
     s.add_argument("id")
     s.add_argument("-m", "--message", action="append", required=True)
+    add_doc_option(s)
     s.set_defaults(func=cmd_commit)
 
     s = sub.add_parser("finish", help="mark built item awaiting-review and return to base")
@@ -2003,6 +3186,7 @@ def build_parser():
     s.add_argument("--tests-passed", metavar="SUMMARY", help="what ran and passed")
     s.add_argument("--note")
     s.add_argument("--stay", action="store_true", help="stay on the item branch")
+    add_doc_option(s)
     s.set_defaults(func=cmd_finish)
 
     s = sub.add_parser("checkout", help="switch branch keeping .ddd/ state")
@@ -2021,6 +3205,7 @@ def build_parser():
     s.add_argument("--gdoc-check", metavar="READ",
                    help="Google Doc: a read taken after applying those requests; checks the section")
     s.add_argument("--tab", help="Google Doc tab id (default: the doc URL's ?tab=, else the first tab)")
+    add_doc_option(s)
     s.set_defaults(func=cmd_status_block)
 
     s = sub.add_parser("commit-state", help="commit .ddd/ on the base branch")
@@ -2031,11 +3216,13 @@ def build_parser():
     s.add_argument("action", choices=("get", "set"))
     s.add_argument("key", nargs="?")
     s.add_argument("value", nargs="?")
+    add_doc_option(s, "with several docs: the doc's own settings (default: repo-wide)")
     s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("log", help="audit log")
-    s.add_argument("--item")
+    s.add_argument("--item", help="item id (DOC:ID with several docs)")
     s.add_argument("--limit", type=int, default=50)
+    add_doc_option(s, "with several docs: only this doc's entries")
     s.set_defaults(func=cmd_log)
     return p
 

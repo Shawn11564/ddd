@@ -65,6 +65,17 @@ Then translate the answers:
 flags on the item; act on the developer's answer afterwards with `ddd set`
 (see SKILL.md, sync step 5).
 
+## Moves between docs
+
+With several docs ([multi-doc.md](multi-doc.md)), a new item in one doc is
+also matched against items leaving the other docs: removed in their pending
+diff, or removed in an earlier sync. Same tag or identical text is a sure
+move (`joint.moves`); a similar item, or a tag still live in the other doc, is
+a question (`joint.proposed_moves`): "Did 'X' move here from network's 'Y'?"
+Yes → `--move DOC:KEY=DOC:ID`, no → `--no-move DOC:KEY`. A moved item keeps
+its id (or takes its new tag), state, branch, commits and log, and records
+`moved_from`.
+
 ## Hot items
 
 Every change of type `renamed`, `edited`, `restored` or `queued` adds a

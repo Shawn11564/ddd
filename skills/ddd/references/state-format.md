@@ -11,6 +11,10 @@
 | `.ddd/README.md` | yes | One-paragraph explanation for humans |
 | `.ddd/tmp/` | no (`.ddd/.gitignore`) | Fetched doc text, pending diff |
 
+With several docs ([multi-doc.md](multi-doc.md)), `config.json` and
+`log.jsonl` stay at `.ddd/` and each doc's `items.json`, `snapshot.md` and
+`tmp/` move to `.ddd/docs/<name>/`. The first `ddd doc add` makes that move.
+
 ## config.json
 
 | Key | Default | Meaning |
@@ -26,6 +30,15 @@
 | `auto.max_items` | null | Default item limit for auto mode |
 | `capabilities.read` / `.targeted_edit` / `.comments` | null | Cached MCP capabilities (Google Docs) |
 | `doc.tab` | none | Google Doc tab to write the status section to, from the URL's `?tab=` |
+
+Several docs: `doc` is replaced by `docs` {name: {type, path, url, id, tab,
+scope, test_command, branch_prefix, status_section, former_names,
+legacy_trailers}} and `doc_order`; `version` is 2. The doc's own settings win
+over the repo-wide ones; `branch_prefix` defaults to `ddd/<name>/`.
+`legacy_trailers` marks the doc that existed before (its bare trailers count).
+`wait_for` (from `doc add --wait-for`) lists items whose leaving their own doc
+the doc's first sync waits for; it is removed once they all have
+([multi-doc.md](multi-doc.md#waiting-for-a-cut)).
 
 ## items.json
 
@@ -57,7 +70,9 @@ the last sync, recorded by `diff --doc-version` and `accept`.
 FILE arguments (`diff`, `parse`) take Markdown, a `.b64` file, or a connector's
 result saved as JSON (`{"content": "<base64 or text>"}`).
 
-`flags`: `changed-after-build`, `removed-from-doc`. `done_by`: `developer` (ticked
+`needs`: the item's `Needs:` references. `moved_from`: qualified ids it had in
+other docs; `old_trailers`: bare ids its commits carried before the project had
+several docs. `flags`: `changed-after-build`, `removed-from-doc`. `done_by`: `developer` (ticked
 in the doc), `merge`, `agent`. `derived_from` / `merged_into` record splits and
 merges. `doc_hash` covers the doc without the status section, with whitespace
 normalised.
@@ -76,6 +91,10 @@ One JSON object per line, each with `ts` and `type`:
 | `state` | `item`, `from`, `to`, `branch`, `commits`, `note`, `question`, `tests`, `how` |
 | `commit` | `item`, `commit`, `branch` |
 | `status-write`, `config` | what was written or set |
+| `move` | `item`, `from` (qualified id in the doc it left) |
+| `doc-migrate`, `doc-add`, `doc-rename`, `doc-remove` | `doc`, and `source` / `from` |
+
+With several docs every entry also has `doc`.
 
 Together with the trailers in git, this answers "which doc change led to which
 commits": `ddd log --item login`.
@@ -87,10 +106,12 @@ commits": `ddd log --item login`.
 | `init --doc PATH\|URL [--base B] [--test CMD] [--force]` | Create `.ddd/` |
 | `info` | Config, state counts, flags, git branch and dirty files |
 | `parse FILE [--outline] [--compare OTHER]` | Parse a doc and print its items, one line per item, or what differs in OTHER (no state needed; for validating drafts and conversions) |
-| `survey [--limit N]` | Facts about the project for Initialize mode: stack, manifests, tests, CI, docs, code markers, git with `base_guess`/`on_base` (no state needed) |
+| `survey [--limit N] [--scope DIR]` | Facts about the project for Initialize mode: stack, manifests, tests, CI, docs, code markers, git with `base_guess`/`on_base` (no state needed). `--scope`: one folder only, plus `scope` with its test command, git history and the tracked `related_items` about it (New doc mode) |
 | `diff [FILE] [--doc-version V]` | Compare the doc with the last sync; saves a pending diff. Google Doc: without FILE, only reports whether V (modified time or revision) differs from the last synced version (`fetch_skipped` / `fetch_needed`) |
-| `accept [--match K=ID] [--new K] [--split ID=K,K] [--merge ID,ID=K] [--accept-proposed]` | Apply the pending diff |
-| `rank [--queued] [--limit N]` | Work candidates with signals; `--queued` for auto mode |
+| `accept [--match K=ID] [--new K] [--split ID=K,K] [--merge ID,ID=K] [--accept-proposed]` | Apply the pending diff (several docs: every pending diff at once; keys as `DOC:KEY`; `--move DOC:KEY=DOC:ID`, `--no-move DOC:KEY`) |
+| `rank [--queued] [--limit N]` | Work candidates with signals (`stack_on`, `needs_unresolved`), `blocked`, and `waiting` (items whose `Needs:` are not done); `--queued` for auto mode |
+| `doc add NAME PATH\|URL [--scope DIR] [--test CMD] [--first-name NAME] [--wait-for ID]...` / `doc list` / `doc rename OLD NEW` / `doc remove NAME [--force]` | Several docs ([multi-doc.md](multi-doc.md)) |
+| `doc suggest PATH\|URL [--file SAVED]` | Best-guess `doc add` settings for a doc not tracked yet: name, the existing doc's name, scope, test command, items already tracked elsewhere, and what to confirm. Changes nothing; works without `.ddd/` ([multi-doc.md](multi-doc.md#adding-a-doc-interactively)) |
 | `items [--state S]` / `show ID` | List items / full record |
 | `set ID [STATE] [--note] [--question] [--branch] [--commit SHA] [--comment-id ID --comment-kind K] [--clear-flags]` | Update an item |
 | `start ID [--from BRANCH]` | Branch and mark in progress |
@@ -103,5 +124,9 @@ commits": `ddd log --item login`.
 | `commit-state [-m MSG]` | Commit `.ddd/` on the base branch |
 | `config get [KEY]` / `config set KEY VALUE` | Dotted keys; VALUE parsed as JSON when possible |
 | `log [--item ID] [--limit N]` | Audit trail |
+
+With several docs, `--doc NAME` picks the doc for `diff`, `accept`,
+`status-block`, `show`, `set`, `start`, `commit`, `finish` and `config`, and
+filters `rank`, `items`, `info` and `log`. Item ids may be qualified (`doc:id`).
 
 Exit codes: `0` ok, `1` error, `2` input needed, `3` doc changed since last sync.

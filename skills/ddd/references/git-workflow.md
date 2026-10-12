@@ -2,7 +2,8 @@
 
 ## One branch per item
 
-`ddd start ID` creates `ddd/ID` (prefix: `branch_prefix`) from the base branch,
+`ddd start ID` creates `ddd/ID` (prefix: `branch_prefix`; with several docs
+`ddd/<doc>/ID`, and the trailer below is `DDD-Item: doc:ID`) from the base branch,
 or checks out the existing branch to resume. It refuses (exit 2) while tracked
 files have uncommitted changes, apart from `.ddd/` and a local Markdown doc.
 Untracked files don't block. Ask the developer; never stash or discard their

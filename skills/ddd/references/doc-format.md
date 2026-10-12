@@ -14,6 +14,7 @@ starting point.
 | `☐ text` / `☑ text` | The same, as Google Docs exports checklists |
 | Other lines | The description of the item above them. Indented lines under a task belong to that task. |
 | `Done when: ...` (also `Acceptance:`) | The item's acceptance criteria; the agent writes tests for them |
+| `Needs: {#tag}` (also `{#doc:tag}`, several allowed) | The item waits until those items are done. A `Needs` line without a `{#...}` reference is plain description |
 
 A heading with tasks under it is a group; the agent builds its tasks. A heading
 with no tasks but a description is built as one item. A heading whose tasks are

@@ -117,7 +117,7 @@ class ModeCommands(unittest.TestCase):
             self.modes = skill_modes(f.read())
 
     def test_one_command_per_mode(self):
-        self.assertEqual(self.modes, {"menu", "auto", "status", "setup", "initialize"})
+        self.assertEqual(self.modes, {"menu", "auto", "status", "setup", "initialize", "doc"})
         self.assertEqual(set(command_files()), self.modes)
 
     def test_command_files(self):

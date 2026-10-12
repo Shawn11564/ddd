@@ -174,6 +174,62 @@
         "In the doc: a DDD Status heading at the end with login under Awaiting review as a bullet; every other paragraph unchanged",
         "Running it again replaces the section instead of adding a second one"
       ]
+    },
+    {
+      "id": 15,
+      "name": "split-into-two-docs",
+      "setup": "After eval 1, the developer moved the Division and Scientific mode sections out of docs/plan.md into a new docs/advanced.md (same text, under a '# Advanced plan' title).",
+      "prompt": "I split the plan: Division and Scientific mode now live in docs/advanced.md. Track it as its own doc called advanced, and call the existing one basics.",
+      "expectations": [
+        "Runs `ddd.py doc add advanced docs/advanced.md --first-name basics` (no other name questions)",
+        "Syncs both docs (`diff --doc basics`, `diff --doc advanced`) and applies them with one `accept`",
+        "Division and Scientific mode keep their ids and states as moves (joint.moves), with no question about them",
+        "Refers to items with qualified ids (advanced:division) and shows the doc in its report",
+        "Writes a status section into each doc with `status-block --doc NAME --write`, and runs `commit-state` on main",
+        "Edits neither doc outside its status section"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "needs-across-docs",
+      "setup": "As eval 15's result (docs basics and advanced, synced), plus in docs/advanced.md: Division is marked [next] and has the line 'Needs: {#basics:subtract}'.",
+      "prompt": "ddd auto",
+      "expectations": [
+        "Builds basics:subtract on ddd/basics/subtract and basics:multiply-two-numbers on its own ddd/basics/ branch",
+        "Builds advanced:division only after subtract is awaiting review, starting it `--from` subtract's branch (signals.stack_on) or a stacked branch that contains it, and says so",
+        "Commits carry qualified trailers (`DDD-Item: basics:subtract`, `DDD-Item: advanced:division`)",
+        "Never builds Scientific mode (blocked)",
+        "Writes each doc's status section and runs `commit-state`; does not push or merge"
+      ]
+    },
+    {
+      "id": 17,
+      "name": "doc-add-interactive",
+      "setup": "After eval 1, the developer copied the Division and Scientific mode sections into a new docs/advanced.md (under a '# Advanced plan' title) but left them in docs/plan.md too.",
+      "prompt": "ddd doc add docs/advanced.md",
+      "expectations": [
+        "Runs `ddd.py doc suggest docs/advanced.md` and runs the test command before asking anything",
+        "Asks once, in one message, with a recommendation for each: the new doc's name (advanced), the existing doc's name (calculator, from its title), no scope, the repo's test command with its result",
+        "In the same message, says Division and Scientific mode are still in docs/plan.md and asks whether they moved (cut them from plan.md first) or are copies",
+        "Runs no `doc add` before the developer answers",
+        "After the developer says 'moved, I cut them; names fine': runs `ddd.py doc add advanced docs/advanced.md --first-name calculator`, syncs both docs and applies them with one `accept`, Division and Scientific mode keeping their ids and states as moves",
+        "Edits neither doc outside its status section and never cuts the sections itself"
+      ]
+    },
+    {
+      "id": 18,
+      "name": "doc-new-for-a-folder",
+      "setup": "After eval 1, plus a committed folder scientific/ holding trig.py (sin and cos that raise NotImplementedError, a TODO for tan) and test_trig.py (one skipped test).",
+      "prompt": "ddd doc new scientific",
+      "expectations": [
+        "Runs `ddd.py survey --scope scientific`, reads scientific/ (trig.py, test_trig.py), and sees Scientific mode in `scope.related_items`",
+        "Asks once, with recommendations: Markdown at scientific/plan.md or a Google Doc, the doc name scientific, the existing doc's name calculator, the test command, and whether Scientific mode moves to the new doc (recommended)",
+        "After 'Markdown, move it': drafts from the folder's code (sin, cos, tan with evidence, the skipped test as a known issue) and carries Scientific mode over word for word, tagged {#scientific-mode} and still [blocked]",
+        "Validates the draft with `parse --outline` and `doc suggest` before writing scientific/plan.md, which it leaves uncommitted",
+        "Runs `ddd.py doc add scientific scientific/plan.md --scope scientific --first-name calculator --wait-for scientific-mode` (plus `--test` only if a command ran)",
+        "Tells the developer to cut the Scientific mode section from docs/plan.md, never cuts it itself, and reports the new doc as held until then",
+        "Edits docs/plan.md only inside its status section; does not push or merge"
+      ]
     }
   ]
 }

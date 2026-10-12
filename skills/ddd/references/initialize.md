@@ -5,6 +5,10 @@ yet. You survey the project, work out what exists and what is unfinished, draft
 the doc in the conventions of [doc-format.md](doc-format.md), create it as a
 Markdown file or a Google Doc, and set ddd up on it.
 
+For one part of a project that is already planned (a doc of its own for
+one game or service), New doc mode runs these steps limited to one folder:
+[multi-doc.md](multi-doc.md#a-new-doc-for-part-of-the-project).
+
 The doc you draft becomes the developer's the moment it exists. After that, the
 usual rules apply: you write only the status section and comments.
 

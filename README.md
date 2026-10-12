@@ -57,11 +57,14 @@ are needed by the skill itself.
 | `/ddd auto` (or `/ddd auto 3`) | Sync, then builds `[next]` items in doc order until the queue is empty, it needs your input, or N items are done |
 | `/ddd status` | Sync and report; builds nothing |
 | `/ddd initialize` | Surveys the code and drafts the first plan for you, as a Markdown file or a Google Doc (you choose), then sets up |
+| `/ddd doc add <doc-path-or-url>` | Adds another plan to the repo: reads the doc, guesses its name, folder and test command, spots sections still in another doc, asks you to confirm in one message, then adds it and syncs |
+| `/ddd doc new <folder> [markdown\|gdoc]` | Drafts a standalone plan for one part of the project (a game, service or package) from its code, carries over what your existing doc already plans for it, adds it as another doc and tells you what to cut from the old one |
 | `/ddd setup` | First-run setup (also automatic) |
 
 **Completion in Claude Code:** every mode is also its own command, so type
 `/ddd:` and the menu lists them all: `/ddd:menu`, `/ddd:auto [max-items]`,
-`/ddd:status`, `/ddd:setup [doc-path-or-url]`, `/ddd:initialize [markdown|gdoc]`.
+`/ddd:status`, `/ddd:setup [doc-path-or-url]`, `/ddd:initialize [markdown|gdoc]`,
+`/ddd:doc add <doc-path-or-url>`, `/ddd:doc new <folder> [markdown|gdoc]`.
 The plugin provides them; `install.sh`/`install.ps1` copy them to
 `~/.claude/commands/ddd/` (or `.claude/commands/ddd/` with `--target project`).
 Use one install method, not both, or each command is listed twice.
@@ -85,6 +88,7 @@ Users sign in with email and password.
 - [ ] Login form {#login}          <- task
   - Done when: bad passwords show an inline error   <- acceptance criteria -> tests
 - [ ] Password reset by email
+  - Needs: {#login}                <- waits until Login form is done
 - [x] Logout button                <- you ticked it: done
 
 ## Dark mode [blocked]             <- off limits until you remove [blocked]
@@ -119,6 +123,25 @@ changed, because fetching a Google Doc costs tokens in proportion to its size.
 Google's Markdown import cuts a heading at its first `{`, so in a Google Doc
 put a heading's tag on its own line under it (`{#auth} [next]`). Details:
 [backends.md](skills/ddd/references/backends.md).
+
+### Several docs
+
+A repo can have several plans, say a network doc and one doc per game. Add
+one with `/ddd doc add <doc-path-or-url>`. The agent reads it and proposes a
+name (and a name for the existing doc), the folder it plans and that folder's
+test command. If the doc's sections are also still in another doc, it asks
+whether they moved or were copied. You confirm in one message. The script
+command underneath is `ddd doc add clash games/clash/plan.md --scope
+games/clash` (the first one also names the existing doc: `--first-name
+network`). Or let the agent write one: `/ddd doc new games/clash` surveys that
+folder, drafts its plan (Markdown or a Google Doc), copies the Clash sections
+from your existing doc into it, and holds its first sync until you've cut
+those sections from the old doc, so they move with their state and branches. One `.ddd/`
+tracks them all: one menu across every doc, `ddd auto clash` for one doc,
+branches like `ddd/clash/kits`, and a status section per doc. Cut a section
+from one doc and paste it into another: the items keep their state and
+branches. `Needs: {#network:live-reload}` makes an item wait for an item in
+another doc. Details: [multi-doc.md](skills/ddd/references/multi-doc.md).
 
 ## How it tracks your items
 

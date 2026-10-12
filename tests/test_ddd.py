@@ -8,6 +8,8 @@ Run from the repo root:  python -m unittest discover -s tests -v
 - WorkflowTests drives the CLI end to end in a throwaway git repo: sync,
   rank, start, commit, finish, status write, merge and squash-merge detection,
   plus `survey` and the Initialize draft structure.
+- MultiDocTests covers several docs in one .ddd/ (references/multi-doc.md):
+  migration, moves between docs, Needs, per-doc branches, trailers, settings.
 """
 
 import json
@@ -166,6 +168,14 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(doc["items"][0]["tag"], "first")
         self.assertEqual(doc["items"][0]["markers"], ["notes"])
         self.assertEqual(len(doc["warnings"]), 1)
+
+    def test_needs_references(self):
+        doc = ddd.parse_doc("# P\n\n## Launch {#launch}\n\nNeeds: {#network:live-reload} and {#tebex}\n"
+                            "Needs a Minehut server.\n\n- [ ] Task\n  - Needs: {\\#gems}\n")
+        items = {it["title"]: it for it in doc["items"]}
+        self.assertEqual(items["Launch"]["needs"], ["network:live-reload", "tebex"])
+        self.assertEqual(items["Launch"]["tag"], "launch")
+        self.assertEqual(items["Task"]["needs"], ["gems"])  # Google's export escapes the brace
 
     def test_code_fences_are_body(self):
         items = self.parse("## Setup\n\n```\n# not a heading\n- [ ] not a task\n```\n")
@@ -493,7 +503,8 @@ class GdocStatusTests(unittest.TestCase):
         self.assertEqual(len(ddd.gdoc_status_check(fake.read(), args["expected"], "DDD Status")), 1)
 
 
-class WorkflowTests(unittest.TestCase):
+class RepoCase(unittest.TestCase):
+    """A throwaway git repo on `main` holding plan.md and app.txt, and the CLI."""
     PLAN = ("# Plan\n\n## Sign-in {#auth} [next]\n\n- [ ] Login form {#login}\n"
             "  - Done when: bad passwords show an error\n- [ ] Logout button\n\n## Dark mode\n\nTheme toggle.\n")
 
@@ -523,8 +534,8 @@ class WorkflowTests(unittest.TestCase):
         with open(os.path.join(self.root, rel), encoding="utf-8") as f:
             return f.read()
 
-    def ddd(self, *argv, code=0):
-        out = subprocess.run([sys.executable, SCRIPT] + list(argv), cwd=self.root, env=self.env,
+    def ddd(self, *argv, code=0, cwd=None):
+        out = subprocess.run([sys.executable, SCRIPT] + list(argv), cwd=cwd or self.root, env=self.env,
                              capture_output=True)
         text = out.stdout.decode("utf-8")
         self.assertEqual(out.returncode, code, text + out.stderr.decode("utf-8", "replace"))
@@ -542,6 +553,8 @@ class WorkflowTests(unittest.TestCase):
         self.ddd("commit", iid, "-m", "Build %s" % iid)
         return started
 
+
+class WorkflowTests(RepoCase):
     def test_full_cycle_merge(self):
         self.init_and_sync()
         self.assertEqual(self.ddd("config", "get", "base_branch")["value"], "main")
@@ -904,3 +917,393 @@ class WorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultiDocTests(RepoCase):
+    """Several docs in one .ddd/ (references/multi-doc.md): migration, moves
+    between docs, Needs, per-doc branches, trailers and settings."""
+    PLAN = ("# Network plan\n\n## Live updates [next]\n\n- [ ] Reload config {#live-reload}\n"
+            "  - Done when: config reloads\n\n## Lobby {#lobby}\n\nThe hub everyone joins.\n\n"
+            "## Finish Clash\n\n- [x] Step 1: core extraction\n- [ ] Step 4: roles and kits {#clash-kits}\n"
+            "  - Done when: KitTest passes\n")
+    CLASH = ("# Clash plan\n\n## Finish Clash\n\n- [x] Step 1: core extraction\n"
+             "- [ ] Step 4: roles and kits {#clash-kits}\n  - Done when: KitTest passes\n")
+
+    def network_only(self):
+        return self.PLAN.split("## Finish Clash")[0]
+
+    def split(self, clash=None):
+        """The developer moves the Clash section into games/clash/plan.md; ddd adds it as a doc."""
+        os.makedirs(os.path.join(self.root, "games", "clash"), exist_ok=True)
+        self.write("plan.md", self.network_only())
+        self.write("games/clash/plan.md", clash if clash is not None else self.CLASH)
+        return self.ddd("doc", "add", "clash", "games/clash/plan.md", "--first-name", "network",
+                        "--scope", "games/clash")
+
+    def sync_all(self):
+        self.ddd("diff", "--doc", "network")
+        return self.ddd("diff", "--doc", "clash")
+
+    def squash(self, branch, trailer):
+        self.git("merge", "-q", "--squash", branch)
+        self.git("commit", "-qm", "Squashed\n\n%s" % trailer)
+
+    def test_migration_keeps_ids_branches_and_old_trailers(self):
+        self.init_and_sync()
+        self.build("live-reload", "v1\n")
+        self.assertIn("DDD-Item: live-reload", self.git("log", "-1", "--format=%B"))
+        self.ddd("finish", "live-reload", "--tests-passed", "true")
+        self.ddd("commit-state")
+        out = self.ddd("doc", "add", "clash", "games/clash/plan.md", code=2)
+        self.assertIn("--first-name", out["error"])
+        added = self.split()
+        self.assertEqual(added["migrated"], "network")
+        self.assertEqual(added["docs"], ["network", "clash"])
+        self.assertTrue(os.path.exists(os.path.join(self.root, ".ddd", "docs", "network", "items.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".ddd", "items.json")))
+        rec = self.ddd("show", "network:live-reload")
+        self.assertEqual((rec["state"], rec["branch"]), ("awaiting-review", "ddd/live-reload"))
+        # the commit made before the migration carries the bare trailer
+        self.ddd("commit-state")
+        self.squash("ddd/live-reload", "DDD-Item: live-reload")
+        merged = self.ddd("sync-git")["merged"]
+        self.assertEqual([(m["id"], m["how"]) for m in merged], [("network:live-reload", "squash-merged")])
+        started = self.ddd("start", "lobby")
+        self.assertEqual(started["id"], "network:lobby")
+        self.assertEqual(started["branch"], "ddd/network/lobby")
+        self.assertEqual(started["commit_trailer"], "DDD-Item: network:lobby")
+
+    def test_move_between_docs_keeps_state_and_history(self):
+        self.init_and_sync()
+        self.build("clash-kits", "kits\n")
+        self.ddd("finish", "clash-kits", "--tests-passed", "true")
+        self.ddd("commit-state")
+        self.split()
+        network = self.ddd("diff", "--doc", "network")
+        self.assertEqual(sorted(r["id"] for r in network["removed"]),
+                         ["clash-kits", "finish-clash", "step-1-core-extraction"])
+        clash = self.ddd("diff", "--doc", "clash")
+        moves = sorted((m["from"], m["how"]) for m in clash["joint"]["moves"])
+        self.assertEqual(moves, [("network:clash-kits", "tag"), ("network:finish-clash", "exact"),
+                                 ("network:step-1-core-extraction", "exact")])
+        self.assertEqual(clash["joint"]["proposed_moves"], [])
+        self.assertFalse(clash["needs_input"])
+        acc = self.ddd("accept")
+        self.assertEqual(sorted(acc["docs"]), ["clash", "network"])
+        kits = self.ddd("show", "clash:clash-kits")
+        self.assertEqual((kits["state"], kits["branch"]), ("awaiting-review", "ddd/clash-kits"))
+        self.assertEqual(kits["moved_from"], ["network:clash-kits"])
+        self.assertEqual(self.ddd("show", "clash:step-1-core-extraction")["state"], "done")
+        self.assertEqual(self.ddd("show", "network:clash-kits")["qid"], "clash:clash-kits")
+        ids = [i["id"] for i in self.ddd("items", "--doc", "network")["items"]]
+        self.assertNotIn("network:clash-kits", ids)
+        self.assertEqual(self.ddd("rank")["candidates"][0]["id"], "network:live-reload")
+        # its pre-migration commit (bare trailer) still marks it done after a squash merge
+        self.ddd("commit-state")
+        self.squash("ddd/clash-kits", "DDD-Item: clash-kits")
+        self.assertEqual([m["id"] for m in self.ddd("sync-git")["merged"]], ["clash:clash-kits"])
+
+    def test_uncertain_move_needs_a_decision(self):
+        self.init_and_sync()
+        edited = self.CLASH.replace("Step 4: roles and kits {#clash-kits}", "Step 4: roles, kits and colours") \
+                           .replace("KitTest passes", "KitTest and ColourTest pass")
+        self.split(edited)
+        out = self.sync_all()
+        proposed = out["joint"]["proposed_moves"]
+        self.assertEqual([p["from"] for p in proposed], ["network:clash-kits"])
+        self.assertTrue(out["needs_input"])
+        err = self.ddd("accept", code=2)
+        self.assertEqual(err["proposed_moves"][0]["qkey"], proposed[0]["qkey"])
+        self.ddd("accept", "--move", "%s=network:clash-kits" % proposed[0]["qkey"])
+        rec = self.ddd("show", "clash:clash-kits")  # a moved item keeps its id
+        self.assertEqual(rec["moved_from"], ["network:clash-kits"])
+        self.assertIn("clash-kits", rec.get("old_trailers", []))
+
+    def test_rejected_move_is_a_new_item(self):
+        self.init_and_sync()
+        self.split(self.CLASH.replace("Step 4: roles and kits {#clash-kits}", "Step 4: roles, kits and colours"))
+        qkey = self.sync_all()["joint"]["proposed_moves"][0]["qkey"]
+        self.ddd("accept", "--no-move", qkey)
+        rec = self.ddd("show", "clash:step-4-roles-kits-and-colours")
+        self.assertEqual(rec["state"], "todo")
+        self.assertNotIn("moved_from", rec)
+        self.assertEqual(self.ddd("show", "network:clash-kits")["state"], "removed")
+
+    def test_needs_wait_then_stack_then_free(self):
+        self.init_and_sync()
+        self.split(self.CLASH + "\n## Hill [next]\n\n- [ ] Hill HUD\n  - Needs: {#network:live-reload}\n")
+        self.sync_all()
+        self.ddd("accept")
+        rank = self.ddd("rank", "--queued")
+        self.assertNotIn("clash:hill-hud", [c["id"] for c in rank["candidates"]])
+        self.assertEqual([(w["id"], w["needs"][0]["id"]) for w in rank["waiting"]],
+                         [("clash:hill-hud", "network:live-reload")])
+        block = self.ddd("status-block", "--doc", "clash")["block"]
+        self.assertIn("**Waiting**", block)
+        self.assertIn("Hill HUD - needs network:live-reload (todo)", block)
+        self.build("network:live-reload", "v1\n")
+        self.ddd("finish", "network:live-reload", "--tests-passed", "true")
+        cand = {c["id"]: c for c in self.ddd("rank", "--queued")["candidates"]}
+        self.assertEqual(cand["clash:hill-hud"]["signals"]["stack_on"], "ddd/network/live-reload")
+        warn = self.ddd("start", "clash:hill-hud")["warnings"][0]
+        self.assertIn("start --from ddd/network/live-reload", warn)
+        self.ddd("checkout", "main")
+        self.ddd("set", "clash:hill-hud", "todo")
+        self.ddd("commit-state")
+        self.git("merge", "-q", "--no-ff", "ddd/network/live-reload", "-m", "merge")
+        self.ddd("sync-git")
+        cand = {c["id"]: c for c in self.ddd("rank", "--queued")["candidates"]}
+        self.assertNotIn("stack_on", cand["clash:hill-hud"]["signals"])
+
+    def test_unknown_needs_reference_warns(self):
+        self.init_and_sync()
+        self.split(self.CLASH + "\n- [ ] Banner\n  - Needs: {#network:nope} and {#clash-kits}\n")
+        out = self.sync_all()
+        self.assertEqual(len([w for w in out["warnings"] if "{#network:nope}" in w]), 1)
+        self.assertFalse([w for w in out["warnings"] if "{#clash-kits}" in w])
+
+    def test_same_tag_in_two_docs_stays_apart(self):
+        self.init_and_sync()
+        self.split(self.CLASH + "\n## Lobby {#lobby}\n\nThe arena waiting room.\n")
+        out = self.sync_all()
+        # {#lobby} is still live in the network doc: a possible move, not a sure one
+        qkey = [p["qkey"] for p in out["joint"]["proposed_moves"] if p["from"] == "network:lobby"][0]
+        self.ddd("accept", "--no-move", qkey)
+        self.assertIn("several docs", self.ddd("start", "lobby", code=2)["error"])
+        self.build("clash:lobby", "clash lobby\n")
+        self.assertIn("DDD-Item: clash:lobby", self.git("log", "-1", "--format=%B"))
+        self.ddd("finish", "clash:lobby", "--tests-passed", "true")
+        self.ddd("commit-state")
+        self.squash("ddd/clash/lobby", "DDD-Item: clash:lobby")
+        self.assertEqual([m["id"] for m in self.ddd("sync-git")["merged"]], ["clash:lobby"])
+        self.assertEqual(self.ddd("show", "network:lobby")["state"], "todo")
+
+    def test_other_docs_float(self):
+        """A status write in one doc and an edit in another never block work or get lost."""
+        self.init_and_sync()
+        self.split()
+        self.git("add", "games/clash/plan.md")
+        self.git("commit", "-qm", "clash plan")
+        self.sync_all()
+        self.ddd("accept")
+        self.ddd("commit-state")
+        self.ddd("status-block", "--doc", "network", "--write", "plan.md")
+        self.ddd("status-block", "--doc", "clash", "--write", "games/clash/plan.md")
+        self.write("games/clash/plan.md", self.read("games/clash/plan.md") + "\n- [ ] Typed mid-run\n")
+        self.build("network:live-reload", "v1\n")
+        self.assertIn("Typed mid-run", self.read("games/clash/plan.md"))
+        self.ddd("finish", "network:live-reload", "--tests-passed", "true")
+        self.assertIn("Typed mid-run", self.read("games/clash/plan.md"))
+        self.assertIn("DDD Status", self.read("plan.md"))
+
+    def test_doc_is_picked_by_flag_scope_or_question(self):
+        self.init_and_sync()
+        self.split()
+        err = self.ddd("diff", code=2)
+        self.assertEqual(err["docs"], ["network", "clash"])
+        out = self.ddd("diff", cwd=os.path.join(self.root, "games", "clash"))
+        self.assertEqual(out["doc"], "clash")
+        info = self.ddd("info")
+        self.assertEqual([d["name"] for d in info["docs"]], ["network", "clash"])
+        self.assertTrue(info["docs"][1]["pending_diff"])
+
+    def test_doc_names_and_branch_conflicts(self):
+        self.init_and_sync()
+        self.assertIn("not one of", self.ddd("doc", "add", "auto", "x.md", "--first-name", "network",
+                                             code=1)["error"])
+        self.git("branch", "ddd/clash")
+        self.assertIn("branch ddd/clash exists", self.ddd("doc", "add", "clash", "c.md", "--first-name",
+                                                          "network", code=1)["error"])
+        self.assertTrue(os.path.exists(os.path.join(self.root, ".ddd", "items.json")))  # nothing migrated
+
+    def test_per_doc_settings(self):
+        self.init_and_sync()
+        self.split()
+        self.sync_all()
+        self.ddd("accept")
+        self.ddd("config", "set", "test_command", "make clash", "--doc", "clash")
+        self.assertIn("repo-wide", self.ddd("config", "set", "base_branch", "x", "--doc", "clash",
+                                            code=1)["error"])
+        self.assertEqual(self.ddd("config", "get", "test_command", "--doc", "clash")["value"], "make clash")
+        self.assertEqual(self.ddd("config", "get", "test_command")["value"], "true")
+        self.assertEqual(self.ddd("start", "clash:clash-kits")["test_command"], "make clash")
+        self.ddd("checkout", "main")
+        self.assertEqual(self.ddd("start", "network:lobby")["test_command"], "true")
+
+    def test_rename_keeps_branches_and_trailers(self):
+        self.init_and_sync()
+        self.split()
+        self.sync_all()
+        self.ddd("accept")
+        self.build("clash:clash-kits", "kits\n")
+        self.ddd("finish", "clash:clash-kits", "--tests-passed", "true")
+        self.ddd("doc", "rename", "clash", "arena")
+        rec = self.ddd("show", "arena:clash-kits")
+        self.assertEqual(rec["branch"], "ddd/clash/clash-kits")
+        self.ddd("commit-state")
+        self.squash("ddd/clash/clash-kits", "DDD-Item: clash:clash-kits")
+        self.assertEqual([m["id"] for m in self.ddd("sync-git")["merged"]], ["arena:clash-kits"])
+        self.assertEqual(self.ddd("start", "arena:clash-plan")["branch"], "ddd/clash/clash-plan")
+
+    def clash_module(self):
+        """games/clash as a Gradle subproject, its plan written but not yet tracked."""
+        os.makedirs(os.path.join(self.root, "games", "clash", "src"), exist_ok=True)
+        self.write("settings.gradle.kts", 'rootProject.name = "net"\ninclude("games:clash")\n')
+        self.write("gradlew", "#!/bin/sh\n")
+        self.write("games/clash/build.gradle.kts", "plugins { java }\n")
+        self.write("games/clash/src/Kit.java", "class Kit {}\n")
+        self.write("games/clash/plan.md", self.CLASH.replace("\n\n", "\n\nCode: games/clash/src.\n\n", 1))
+
+    def test_suggest_guesses_settings_and_changes_nothing(self):
+        self.init_and_sync()
+        self.ddd("commit-state")
+        self.clash_module()
+        before = self.read(".ddd/config.json")
+        out = self.ddd("doc", "suggest", "games/clash/plan.md")
+        self.assertEqual((out["project"], out["already_tracked"], out["title"]), ("single", False, "Clash plan"))
+        self.assertEqual((out["name"]["suggested"], out["first_name"]), ("clash", "network"))
+        self.assertEqual(out["scope"]["suggested"], "games/clash")
+        self.assertIn("matches the doc's title", out["scope"]["candidates"][0]["why"])
+        self.assertEqual(out["test_command"]["suggested"], "./gradlew :games:clash:test")
+        self.assertEqual(out["test_command"]["repo"], "true")
+        # the section is still in plan.md too: moving or copying is a question
+        self.assertEqual(sorted((o["id"], o["how"], o["live"]) for o in out["overlap"]),
+                         [("clash-kits", "tag", True), ("finish-clash", "exact", True),
+                          ("step-1-core-extraction", "exact", True)])
+        self.assertTrue(any("moving or copying" in q for q in out["confirm"]))
+        self.assertEqual(self.read(".ddd/config.json"), before)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".ddd", "docs")))
+        # once the developer cuts it, the same items are moves, as the sync finds
+        self.write("plan.md", self.network_only())
+        out = self.ddd("doc", "suggest", "games/clash/plan.md")
+        self.assertEqual(out["overlap_live"], 0)
+        self.assertEqual({o["checked"] for o in out["overlap"]}, {"file"})
+        self.ddd("doc", "add", out["name"]["suggested"], "games/clash/plan.md", "--first-name", out["first_name"],
+                 "--scope", out["scope"]["suggested"], "--test", out["test_command"]["suggested"])
+        clash = self.sync_all()
+        self.assertEqual(len(clash["joint"]["moves"]), len(out["overlap"]))
+        self.assertFalse(clash["needs_input"])
+        self.ddd("accept")
+        self.assertEqual(self.ddd("config", "get", "test_command", "--doc", "clash")["value"],
+                         "./gradlew :games:clash:test")
+        again = self.ddd("doc", "suggest", "games/clash/plan.md")
+        self.assertEqual(again["already_tracked"], "clash")
+
+    def test_suggest_overlap_pairs_like_the_sync(self):
+        """A live item pairs by tag or identical text only (find_moves leaves
+        similar ones alone), and the doc's own title never pairs."""
+        self.write("plan.md", "# Calculator plan\n\nA calculator.\n\n## Division\n\n- [ ] Divide two numbers\n")
+        self.init_and_sync()
+        self.write("advanced.md", "# Advanced plan\n\nAn advanced calculator.\n\n## Division\n\n"
+                                  "- [ ] Divide two numbers\n\n## Divisions\n\n- [ ] Divide by zero\n")
+        out = self.ddd("doc", "suggest", "advanced.md")
+        self.assertEqual([(o["title"], o["how"], o["live"]) for o in out["overlap"]],
+                         [("Division", "exact", True), ("Divide two numbers", "exact", True)])
+
+    def test_survey_scope_lists_the_folder_and_its_tracked_items(self):
+        self.init_and_sync()
+        self.clash_module()
+        self.git("add", "-A")
+        self.git("commit", "-qm", "clash module")
+        out = self.ddd("survey", "--scope", "games/clash")
+        self.assertEqual(out["name"], "clash")
+        self.assertTrue(out["files"] and all(f.startswith("games/clash/") for f in out["top_level"]))
+        self.assertEqual(out["manifests"], ["games/clash/build.gradle.kts"])
+        scope = out["scope"]
+        self.assertEqual(scope["test_command"]["suggested"], "./gradlew :games:clash:test")
+        self.assertEqual(scope["git"]["recent"][0][11:], "clash module")
+        self.assertEqual([(r["id"], r["why"]) for r in scope["related_items"]],
+                         [("finish-clash", ["title"]), ("step-1-core-extraction", ["in section"]),
+                          ("clash-kits", ["in section"])])
+        self.assertIn("folder inside the project", self.ddd("survey", "--scope", "nope", code=1)["error"])
+
+    def test_wait_for_holds_the_first_sync_until_the_cut(self):
+        """doc new: the new doc carries the Clash section (tagged with its ids)
+        while plan.md still has it; the move happens only once it is cut."""
+        self.init_and_sync()
+        self.build("clash-kits", "kits\n")
+        self.ddd("finish", "clash-kits", "--tests-passed", "true")
+        self.ddd("commit-state")
+        self.clash_module()
+        self.write("games/clash/plan.md", "# Clash plan\n\n## Finish Clash {#finish-clash}\n\n"
+                                          "- [x] Step 1: core extraction {#step-1-core-extraction}\n"
+                                          "- [ ] Step 4: roles and kits {#clash-kits}\n"
+                                          "  - Done when: KitTest passes\n\n## Arena HUD\n\n- [ ] Timer bar\n")
+        self.assertIn("unknown item", self.ddd("doc", "add", "clash", "games/clash/plan.md", "--first-name",
+                                               "network", "--wait-for", "nope", code=1)["error"])
+        self.assertTrue(os.path.exists(os.path.join(self.root, ".ddd", "items.json")))  # nothing migrated
+        self.ddd("doc", "add", "clash", "games/clash/plan.md", "--first-name", "network", "--scope", "games/clash",
+                 "--wait-for", "finish-clash", "--wait-for", "step-1-core-extraction", "--wait-for", "clash-kits")
+        self.assertEqual(len(self.ddd("info")["docs"][1]["wait_for"]), 3)
+        self.ddd("diff", "--doc", "network")
+        held = self.ddd("diff", "--doc", "clash")
+        self.assertTrue(held["held"])
+        self.assertEqual(sorted(w["id"] for w in held["waiting_for"]),
+                         ["network:clash-kits", "network:finish-clash", "network:step-1-core-extraction"])
+        self.ddd("accept")
+        self.assertEqual(self.ddd("items", "--doc", "clash")["items"], [])
+        # the developer cuts the section: the hold lifts and the items move
+        self.write("plan.md", self.network_only())
+        self.ddd("diff", "--doc", "network")
+        clash = self.ddd("diff", "--doc", "clash")
+        self.assertNotIn("held", clash)
+        self.assertEqual(sorted((m["from"], m["how"]) for m in clash["joint"]["moves"]),
+                         [("network:clash-kits", "tag"), ("network:finish-clash", "tag"),
+                          ("network:step-1-core-extraction", "tag")])
+        self.assertFalse(clash["needs_input"])
+        self.ddd("accept")
+        kits = self.ddd("show", "clash:clash-kits")
+        self.assertEqual((kits["state"], kits["branch"]), ("awaiting-review", "ddd/clash-kits"))
+        self.assertEqual(self.ddd("info")["docs"][1]["wait_for"], [])
+        # the folder's own doc is not "related" to it
+        self.assertEqual(self.ddd("survey", "--scope", "games/clash")["scope"]["related_items"], [])
+
+    def test_wait_for_can_be_dropped(self):
+        self.init_and_sync()
+        self.clash_module()
+        self.ddd("doc", "add", "clash", "games/clash/plan.md", "--first-name", "network", "--wait-for", "clash-kits")
+        self.assertTrue(self.ddd("diff", "--doc", "clash")["held"])
+        self.ddd("config", "set", "doc.wait_for", "[]", "--doc", "clash")
+        self.assertNotIn("held", self.ddd("diff", "--doc", "clash"))
+
+    def test_suggest_avoids_taken_names(self):
+        self.init_and_sync()
+        self.split()
+        self.sync_all()
+        self.ddd("accept")
+        self.git("branch", "ddd/arena")
+        os.makedirs(os.path.join(self.root, "games", "arena"))
+        self.write("games/arena/plan.md", "# Arena roadmap\n\n## Kits\n\n- [ ] Kit picker\n")
+        out = self.ddd("doc", "suggest", "games/arena/plan.md")
+        self.assertEqual((out["project"], out["first_name"]), ("multi", None))
+        self.assertEqual(out["scope"]["suggested"], "games/arena")
+        self.assertNotIn("arena", [out["name"]["suggested"]] + out["name"]["alternatives"])
+        self.write("games/arena/clash.md", "# Clash\n\n- [ ] Banner\n")
+        names = self.ddd("doc", "suggest", "games/arena/clash.md")["name"]
+        self.assertNotIn("clash", [names["suggested"]] + names["alternatives"])
+
+    def test_suggest_without_ddd_and_for_a_google_doc(self):
+        url = "https://docs.google.com/document/d/abc123/edit?tab=t.0"
+        err = self.ddd("doc", "suggest", url, code=1)
+        self.assertIn("--file", err["error"])
+        saved = os.path.join(self.root, "..", os.path.basename(self.root) + "-read.json")
+        self.addCleanup(lambda: os.path.exists(saved) and os.remove(saved))
+        with open(saved, "w", encoding="utf-8") as f:
+            json.dump({"content": self.PLAN}, f)
+        out = self.ddd("doc", "suggest", url, "--file", saved)
+        self.assertEqual(out["project"], "none")
+        self.assertEqual((out["source"]["type"], out["source"]["tab"]), ("gdoc", "t.0"))
+        self.assertEqual(out["items"], len(ddd.parse_doc(self.PLAN)["items"]))
+        self.assertFalse(any("name" in q for q in out["confirm"]))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".ddd")))
+
+    def test_remove_doc_refuses_active_items(self):
+        self.init_and_sync()
+        self.split()
+        self.sync_all()
+        self.ddd("accept")
+        self.build("clash:clash-kits", "kits\n")
+        self.ddd("finish", "clash:clash-kits", "--tests-passed", "true")
+        self.assertEqual(self.ddd("doc", "remove", "clash", code=2)["active"], ["clash:clash-kits"])
+        self.ddd("doc", "remove", "clash", "--force")
+        self.assertEqual([d["name"] for d in self.ddd("doc", "list")["docs"]], ["network"])
