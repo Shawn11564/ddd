@@ -23,14 +23,24 @@ file. That keeps the skill portable across hosts and free of credentials.
 extracts the id from the URL.
 
 MCP servers differ in tool names and abilities, so detect capabilities from the
-tools' descriptions rather than assuming names. Record what you find once, so
-later runs don't re-probe:
+tools' descriptions rather than assuming names. Record the tool that does each
+job (or `false` when none does), so later runs don't re-probe:
 
 ```
-ddd config set capabilities.read true
-ddd config set capabilities.targeted_edit false
-ddd config set capabilities.comments true
+ddd config set capabilities.read "download_file_content, text/markdown"
+ddd config set capabilities.targeted_edit "update_doc"
+ddd config set capabilities.comments false
 ```
+
+The record is only as good as the tools that were connected when you made it.
+Connectors come and go between sessions: a `false` or `null` written before
+the developer connected the Google Docs connector is wrong once it is there.
+At the start of each run, compare the recorded capabilities with the tools
+this session offers. If a tool could do a job recorded as `false` or `null`
+(say `update_doc` is offered and `targeted_edit` is `false`), probe it and
+record it. If a recorded tool is missing, treat that job as unavailable for
+this run, without changing the record. Never tell the developer a job is
+impossible on the strength of the record alone.
 
 ### Reading
 

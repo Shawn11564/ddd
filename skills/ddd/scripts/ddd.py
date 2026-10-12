@@ -501,6 +501,7 @@ class State:
         self.snapshot_path = os.path.join(self.doc_dir, "snapshot.md")
         self.tmp_dir = os.path.join(self.doc_dir, "tmp")
         self.pending_path = os.path.join(self.tmp_dir, "pending.json")
+        self.fetched_path = os.path.join(self.tmp_dir, "fetched.json")  # `doc add --file`: the first sync's text
         if name:
             pc = self.project.config
             doc = pc["docs"][name]
@@ -1587,6 +1588,7 @@ def doc_summary(st):
     return {"doc_hash": st.data.get("doc_hash"), "doc_version": st.data.get("doc_version"),
             "last_sync": st.data.get("last_sync"), "states": counts,
             "pending_diff": os.path.exists(st.pending_path),
+            "saved_fetch": (load_json(st.fetched_path) or {}).get("doc_version"),
             "flagged": {st.qid(iid): r["flags"] for iid, r in st.items.items() if r.get("flags")}}
 
 
@@ -1605,6 +1607,7 @@ def cmd_info(args):
         st = project.doc()
         info = dict({"root": st.root, "config": st.config}, **doc_summary(st))
         info.pop("doc_version")
+        info.pop("saved_fetch")
     if os.path.isdir(os.path.join(project.root, ".git")) or \
             git(project, "rev-parse", "--git-dir", check=False)[0] == 0:
         info["git"] = {"branch": current_branch(project), "dirty": dirty_files(project)}
@@ -1691,9 +1694,19 @@ def cmd_doc(args):
     if args.action == "add":
         if not args.name or not args.source:
             raise DddError("usage: doc add NAME PATH|URL [--scope DIR] [--test CMD] [--first-name NAME]")
-        migrated = None
+        migrated, fetched = None, None
         for q in args.wait_for or []:
             project.resolve_item(q)  # refuse an unknown id before changing anything
+        if args.file or args.doc_version:
+            # The text already fetched (suggest) or read back (doc new), kept
+            # for the first sync, which then skips the fetch if the doc's
+            # version is still this one.
+            if not (args.file and args.doc_version):
+                raise DddError("--file and --doc-version go together: the text you fetched and the doc's "
+                               "modifiedTime from before that fetch")
+            if doc_source(project.root, args.source)["type"] != "gdoc":
+                raise DddError("--file and --doc-version are for a Google Doc; a Markdown doc is read from its path")
+            fetched = read_doc_input(args.file)
         if not project.multi:
             if not args.first_name:
                 raise DddError("this project has one doc (%s); name it with --first-name NAME so both docs "
@@ -1726,9 +1739,16 @@ def cmd_doc(args):
                   {"version": SCHEMA_VERSION, "items": {}, "doc_hash": None, "last_sync": None})
         project.save_config()
         project.log({"type": "doc-add", "doc": args.name, "source": doc})
-        emit({"ok": True, "added": args.name, "migrated": migrated, "docs": project.names(),
-              "branch_prefix": prefix + args.name + "/",
-              "warnings": test_command_warnings(project.root, args.test)})
+        out = {"ok": True, "added": args.name, "migrated": migrated, "docs": project.names(),
+               "branch_prefix": prefix + args.name + "/",
+               "warnings": test_command_warnings(project.root, args.test)}
+        if fetched is not None:
+            st = project.doc(args.name)
+            parsed = parse_doc(fetched, st.status_title())
+            save_json(st.fetched_path, {"text": fetched, "doc_version": args.doc_version})
+            out["saved_fetch"] = {"doc_version": args.doc_version, "items": len(parsed["items"])}
+            out["warnings"] += parsed["warnings"]
+        emit(out)
         return
     if not project.multi:
         raise DddError("this project has one doc; `doc add` names it and adds another")
@@ -1942,7 +1962,8 @@ def find_overlap(project, doc):
             if it["tag"] and (it["tag"] == sid or it["tag"] == rec.get("tag")
                               or it["tag"] in rec.get("aliases", [])):
                 pairs.append((0, 1.0, it, n, "tag"))
-            elif (it["kind"], it["title_norm"], it["body_norm"]) ==                     (rec.get("kind"), rec.get("title_norm"), rec.get("body_norm")):
+            elif (it["kind"], it["title_norm"], it["body_norm"]) == \
+                    (rec.get("kind"), rec.get("title_norm"), rec.get("body_norm")):
                 pairs.append((1, 1.0, it, n, "exact"))
             elif not live and difflib.SequenceMatcher(
                     None, it["title_norm"], rec.get("title_norm") or "").quick_ratio() >= UNCERTAIN:
@@ -2279,6 +2300,132 @@ def needs_warnings(state, doc):
     return out
 
 
+# --------------------------------------------------------------------------
+# reformat: the same doc in another style (references/reformat.md)
+
+def is_notes(it):
+    return "notes" in it.get("markers", []) or "notes" in it.get("inherited", [])
+
+
+def reformat_report(st, text):
+    """What a rewrite of the doc would change besides its look. A reformat
+    keeps every item, its words, section, order, markers and checkbox; it may
+    pin ids with tags (or drop tags the text still matches without) and add
+    `[notes]` sections. Words are compared normalised, so punctuation, bold,
+    code spans, list markers and line breaks are free."""
+    doc = parse_doc(text, st.status_title())
+    result = compute_diff(st.items, doc)
+    r, matches = result["report"], result["matches"]
+    by_key = {it["key"]: it for it in doc["items"]}
+    problems, added_notes = [], []
+    for e in r["new"]:
+        if is_notes(by_key[e["key"]]):
+            added_notes.append({"line": e["line"], "title": e["title"]})
+        else:
+            problems.append({"problem": "new", "line": e["line"], "title": e["title"],
+                             "fix": "a reformat adds no work: make it description or [notes] text, or take it out"})
+    for e in r["removed"]:
+        problems.append({"problem": "lost", "id": st.qid(e["id"]), "title": e["title"],
+                         "fix": "put it back in its own words, or tag it {#%s} where it went" % e["id"]})
+    uncertain = {p["key"] for p in r["proposed"]}
+    for p in r["proposed"]:
+        problems.append({"problem": "uncertain", "id": st.qid(p["id"]), "line": p["line"], "title": p["title"],
+                         "fix": "tag it {#%s}" % p["id"]})
+    for e in r["changed"]:
+        bad = [t for t in e["types"] if t != "retagged"]
+        if bad and e["key"] not in uncertain:
+            problems.append({"problem": "changed", "id": st.qid(e["id"]), "line": e["line"], "title": e["title"],
+                             "changes": bad, "fix": "keep its words, section, markers and checkbox as they were"})
+    # doc order is build order (auto mode): work items keep theirs
+    work = [it["key"] for it in doc["items"] if it["key"] in matches and not is_notes(it)]
+    drafted = [matches[k]["id"] for k in work]
+    kept = set(drafted)
+    tracked = [iid for iid, _ in sorted(st.items.items(), key=lambda kv: kv[1].get("order", 0)) if iid in kept]
+    if drafted != tracked:
+        n = next(i for i, (a, b) in enumerate(zip(drafted, tracked)) if a != b)
+        problems.append({"problem": "reordered", "id": st.qid(drafted[n]), "title": st.items[drafted[n]].get("title"),
+                         "fix": "keep the items in their order (it is the build order); %s comes first"
+                                % st.qid(tracked[n])})
+    pinned = [st.qid(m["id"]) for k, m in matches.items() if by_key[k]["tag"] == m["id"]]
+    return {"ok": not problems and not r["warnings"], "items": len(doc["items"]),
+            "tracked": sum(1 for rec in st.items.values() if rec.get("state") != "removed"),
+            "kept": len(matches), "tagged": len(pinned), "added_notes": added_notes, "problems": problems,
+            "warnings": r["warnings"], "has_status_section": doc["has_status_section"]}
+
+
+def reformat_fresh(st):
+    """A reformat starts from the doc as last synced: no open diff, and a
+    Markdown file untouched since."""
+    if not st.data.get("doc_hash"):
+        raise DddError("sync the doc first: there is nothing tracked to keep yet")
+    pending = load_json(st.pending_path)
+    if pending and pending.get("doc_hash") != st.data.get("doc_hash"):
+        raise DddError("finish the sync first (`ddd accept`): the doc has changes not accepted yet", code=3)
+    path = st.config["doc"].get("path")
+    if st.config["doc"].get("type") == "markdown" and path:
+        if doc_hash(read_text(os.path.join(st.root, path)), st.status_title()) != st.data["doc_hash"]:
+            raise DddError("%s changed since the last sync; sync it, then redo the reformat" % path, code=3)
+
+
+def cmd_reformat(args):
+    st = load_state(args)
+    cfg = st.config["doc"]
+    if args.action == "relink":
+        # A Google Doc is reformatted into a new doc (references/reformat.md):
+        # point ddd at it, keeping every item and its state.
+        if cfg.get("type") != "gdoc":
+            raise DddError("relink is for a Google Doc; a Markdown doc is rewritten with `reformat write`")
+        reformat_fresh(st)
+        if args.old_version and args.old_version != st.data.get("doc_version"):
+            raise DddError("the old doc changed since the last sync (version %s, synced %s): sync it, then "
+                           "redo the reformat from its new text" % (args.old_version, st.data.get("doc_version")),
+                           code=3)
+        new = doc_source(st.root, args.target)
+        if new["type"] != "gdoc":
+            raise DddError("relink takes the new Google Doc's URL")
+        node = st.project.config["docs"][st.name] if st.name else st.project.config["doc"]
+        old = {k: node.get(k) for k in ("url", "id", "tab")}
+        node["former_urls"] = node.get("former_urls", []) + [old["url"]]
+        node.update({"url": new["url"], "id": new["id"]})
+        node.pop("tab", None)
+        if new.get("tab"):
+            node["tab"] = new["tab"]
+        st.project.save_config()
+        st.data["doc_version"] = None  # a new doc: its first fetch has no version to skip on
+        st.save()
+        st.log({"type": "doc-relink", "from": old["url"], "to": new["url"]})
+        emit({"ok": True, "from": old["url"], "to": new["url"]})
+        return
+    reformat_fresh(st)
+    text = read_doc_input(args.target)
+    report = reformat_report(st, text)
+    if args.action == "check":
+        emit(report)
+        return
+    # write: replace a Markdown doc with the reformatted text
+    if cfg.get("type") != "markdown" or not cfg.get("path"):
+        raise DddError("write replaces a Markdown doc; a Google Doc is reformatted into a new doc and "
+                       "relinked (references/reformat.md)")
+    if not report["ok"]:
+        raise DddError("the reformat would change more than the doc's look; fix the problems first",
+                       problems=report["problems"], warnings=report["warnings"])
+    path = os.path.join(st.root, cfg["path"])
+    current = read_text(path)
+    lines = split_lines(current)
+    span = status_span(lines, st.status_title())
+    out = text.replace("\r\n", "\n")
+    if span and not report["has_status_section"]:
+        out = out.rstrip("\n") + "\n\n" + "\n".join(lines[span[0]:span[1]]).strip("\n") + "\n"
+    if "\r\n" in current:
+        out = out.replace("\n", "\r\n")
+    os.makedirs(st.tmp_dir, exist_ok=True)
+    backup = os.path.join(st.tmp_dir, "before-reformat.md")
+    write_text(backup, current)
+    write_text(path, out)
+    st.log({"type": "reformat", "path": cfg["path"], "items": report["kept"]})
+    emit(dict(report, written=cfg["path"], backup=os.path.relpath(backup, st.root).replace("\\", "/")))
+
+
 def cmd_parse(args):
     st = State(args.root) if args.root else None
     title = st.status_title() if st else "DDD Status"
@@ -2326,7 +2473,14 @@ def cmd_diff(args):
         emit({"doc": st.name, "held": True, "waiting_for": held, "fetch_skipped": True, "fetch_needed": False,
               "doc_unchanged": True, "needs_input": False})
         return
-    if version and not args.file and st.config["doc"].get("type") == "gdoc":
+    text, saved = None, load_json(st.fetched_path)
+    if saved and (version or args.file):
+        # `doc add --file`: the text fetched then stands in for the first
+        # fetch while the doc is still at that version; a newer one is stale.
+        if not args.file and saved.get("doc_version") == version:
+            text = saved["text"]
+        os.remove(st.fetched_path)
+    if text is None and version and not args.file and st.config["doc"].get("type") == "gdoc":
         # Cheap check before fetching a Google Doc: same version, same text.
         pending = load_json(st.pending_path)
         open_diff = bool(pending) and pending.get("doc_hash") != st.data.get("doc_hash")
@@ -2335,10 +2489,13 @@ def cmd_diff(args):
               "needs_input": False, "doc_version": version,
               "previous_doc_version": st.data.get("doc_version"), "doc_hash": st.data.get("doc_hash")})
         return
-    text = doc_text_for(st, args.file)
+    from_saved = text is not None
+    text = text if from_saved else doc_text_for(st, args.file)
     doc = parse_doc(text, st.status_title())
     result = compute_diff(st.items, doc)
     report = result["report"]
+    if from_saved:
+        report["saved_fetch_used"] = True
     report["warnings"] += needs_warnings(st, doc)
     report["doc_hash"] = doc["hash"]
     report["previous_doc_hash"] = st.data.get("doc_hash")
@@ -2963,8 +3120,12 @@ def survey_git(root):
 
 def related_items(root, scope):
     """Tracked items that are about `scope`: they name its path, or its folder
-    name in their title or body. A doc planned for that folder should carry
-    them over (references/multi-doc.md, "A new doc for part of the project")."""
+    name in their title, tag or body. A doc planned for that folder should
+    carry them over (references/multi-doc.md, "A new doc for part of the
+    project"). The rest of a section comes along only when its heading is
+    about the folder (title or tag): a passing mention in a section's text,
+    or in the doc's intro, lists that item alone. The doc's title heading is
+    left out."""
     if not os.path.exists(os.path.join(root, STATE_DIR, "config.json")):
         return []
     project = Project(root)
@@ -2973,19 +3134,23 @@ def related_items(root, scope):
     for st in (project.docs() if project.multi else [project.doc()]):
         if (st.config["doc"].get("scope") or "").strip("/") == scope:
             continue  # the folder's own doc
-        hits = set()
-        for sid, rec in sorted(st.items.items(), key=lambda kv: kv[1].get("order", 0)):
-            if rec.get("state") == "removed":
+        ordered = sorted(st.items.items(), key=lambda kv: kv[1].get("order", 0))
+        first = ordered[0][1] if ordered else {}
+        title_id = ordered[0][0] if first.get("kind") == "heading" and first.get("level") == 1 else None
+        sections = set()  # headings about the scope, and what is under them
+        for sid, rec in ordered:
+            if rec.get("state") == "removed" or sid == title_id:
                 continue
             title, body = rec.get("title") or "", rec.get("body") or ""
             text = (title + "\n" + body).lower()
             why = [w for w, hit in (("path", scope.lower() + "/" in text or ("/" in scope and scope.lower() in text)),
-                                    ("title", bool(words & set(name_words(title)))),
+                                    ("title", bool(words & set(name_words(title + " " + (rec.get("tag") or ""))))),
                                     ("body", bool(words & set(name_words(body))))) if hit]
-            if rec.get("parent") in hits:
-                why.append("in section")  # the rest of a section about the scope comes along
+            if rec.get("parent") in sections:
+                why.append("in section")
+            if "title" in why or "in section" in why:
+                sections.add(sid)
             if why:
-                hits.add(sid)
                 out.append({"id": st.qid(sid), "doc": st.name, "title": rec.get("title"), "kind": rec.get("kind"),
                             "parent": st.qid(rec["parent"]) if rec.get("parent") else None,
                             "line": rec.get("line"), "tag": rec.get("tag"), "state": rec.get("state"), "why": why})
@@ -3098,7 +3263,10 @@ def build_parser():
     s.add_argument("name", nargs="?", help="doc name (rename: the old name; suggest: the Markdown path or "
                                            "Google Docs URL)")
     s.add_argument("source", nargs="?", help="add: Markdown path or Google Docs URL; rename: the new name")
-    s.add_argument("--file", help="suggest: the doc's text, fetched and saved (needed for a Google Doc)")
+    s.add_argument("--file", help="suggest: the doc's text, fetched and saved (needed for a Google Doc); add: "
+                                  "that text, kept for the first sync (with --doc-version)")
+    s.add_argument("--doc-version", help="add, with --file: the Google Doc's modifiedTime from before that fetch; "
+                                         "the first sync reuses the text while the doc is unchanged")
     s.add_argument("--scope", help="add: folder whose work this doc plans (picks the doc by cwd)")
     s.add_argument("--test", help="add: the doc's own test command (default: the repo's)")
     s.add_argument("--first-name", help="add, single-doc project: the name for the existing doc")
@@ -3107,6 +3275,16 @@ def build_parser():
                         "own doc, so it moves with its state; repeatable")
     s.add_argument("--force", action="store_true", help="remove: even with active items")
     s.set_defaults(func=cmd_doc)
+
+    s = sub.add_parser("reformat", help="the doc in another style (references/reformat.md): check a draft keeps "
+                                        "every item; write it over a Markdown doc; relink to a new Google Doc")
+    s.add_argument("action", choices=("check", "write", "relink"))
+    s.add_argument("target", help="check, write: the draft (Markdown, .b64 or a saved read-back); relink: the "
+                                  "new Google Doc's URL")
+    s.add_argument("--old-version", metavar="V", help="relink: the old doc's modifiedTime now; refused if it "
+                                                     "changed since the last sync")
+    add_doc_option(s)
+    s.set_defaults(func=cmd_reformat)
 
     s = sub.add_parser("parse", help="parse a doc and print its items (no state needed)")
     s.add_argument("file", help="Markdown, a .b64 file, or a saved connector result (JSON)")

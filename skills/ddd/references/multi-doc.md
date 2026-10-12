@@ -90,14 +90,17 @@ message. `ddd doc add NAME <path-or-url>` or flags (`--scope`, `--test`,
    [--test "<cmd as it ran>"]`. Leave out `--test` if no command ran. Heed
    any `warnings`. If the developer says the items moved but hasn't cut them
    from the other doc yet, add `--wait-for ID` for each live one (see
-   [Waiting for a cut](#waiting-for-a-cut)).
+   [Waiting for a cut](#waiting-for-a-cut)), and with a Google Doc also
+   `--file <saved file> --doc-version <modified time>` from step 1, so the
+   sync after the cut doesn't fetch it again.
 6. **Sync every doc** ([Syncing several docs](#syncing-several-docs)). For
    the new doc, run `ddd diff --doc NAME <saved file> --doc-version <modified
    time>` with the file and time from step 1. Moves need no question;
    `proposed_moves` do. That second question can only come after the sync.
    Then one `ddd accept`.
-7. Google Doc: record its capabilities if config has none yet
-   ([Setup](../SKILL.md#setup) step 4). Then write its status section, run
+7. Google Doc: record its capabilities if config has none yet, or re-check
+   them if this session offers a tool they lack
+   ([backends.md](backends.md#google-docs-through-an-mcp)). Then write its status section, run
    `commit-state`, and report: the name, scope and test command, the item
    count, what moved in with its state, and how to work on it alone
    (`ddd auto NAME`, `ddd status NAME`).
@@ -112,24 +115,32 @@ games/clash`) drafts a doc of its own for one game, service or package from
 its code, then adds it. It is [Initialize](initialize.md) limited to one folder,
 plus carrying over what the existing docs already plan for that folder.
 
-1. **Find the folder.** The arguments name a folder (`games/clash`) or a part
+1. **Sync first.** Run the [usual sync](../SKILL.md#every-run-starts-with-a-sync)
+   on every doc before anything else, and settle its questions. The items
+   you carry over must be the docs' current text, and `related_items` comes
+   from the last sync. A Google Doc that changed is fetched now, once: don't
+   sync it again after `doc add`, since it is read again after the cut.
+2. **Find the folder.** The arguments name a folder (`games/clash`) or a part
    of the project ("the clash game"): find its folder in the tree. If the
    part has no folder of its own, survey without `--scope`, read only its
    code, and add the doc without `--scope`.
-2. **`ddd survey --scope <folder>`.** The usual survey fields (files,
+3. **`ddd survey --scope <folder>`.** The usual survey fields (files,
    manifests, tests, docs, code markers) for that folder only, plus `scope`:
    - `test_command`: the folder's own test command (Gradle subproject, npm,
      Maven, Cargo, Go, pytest, make), or `null` to keep the repo's.
    - `git`: commits touching the folder, recent subjects, and unmerged
      branches with work in it.
    - `related_items`: tracked items about the folder, in every doc, in doc
-     order. `why` is `path` (the doc names the folder's path), `title`,
-     `body` (the folder's name appears there), or `in section` (under such an
-     item). These are the sections the new doc takes over.
+     order. `why` is `path` (the item names the folder's path), `title` (its
+     title or tag names the folder), `body` (its text names the folder), or
+     `in section` (under a heading whose title or tag names it). A passing
+     mention in a section's text lists that heading alone, not everything
+     under it, and the doc's title heading is never listed. The `title`
+     sections are the ones the new doc takes over; judge the rest one by one.
    Then read the folder's README, manifests, entry points and tests (in a
    subagent if it is large), as in [initialize.md](initialize.md#1-survey).
    Run the test command if it is cheap.
-3. **Ask once**, with a recommendation for each:
+4. **Ask once**, with a recommendation for each:
    - the format: a Markdown file (default `<folder>/plan.md`) or a Google Doc
      (title `<Name> plan`), unless the arguments say;
    - the doc's name (default: the folder's name, checked as in
@@ -142,14 +153,14 @@ plus carrying over what the existing docs already plan for that folder.
      new one exists. Items about shared work stay put.
    No `.ddd/` yet: the doc is the project's first. Skip the names and
    related items, and finish with `ddd init` instead of `doc add`.
-4. **Draft** with the structure in [initialize.md](initialize.md#3-draft),
+5. **Draft** with the structure in [initialize.md](initialize.md#3-draft),
    for this folder only: overview, current features, known issues, planned
    features, open questions. Then:
    - **Carry moving items over word for word**: title, body lines,
      `Done when:`, checkbox and markers. Copy them from the doc itself
      (Markdown) or from its snapshot (`.ddd/snapshot.md`, or
-     `.ddd/docs/<name>/snapshot.md` with several docs), which is the doc as
-     of the last sync and saves fetching a Google Doc. Give each one its
+     `.ddd/docs/<name>/snapshot.md` with several docs), which step 1 just
+     brought up to date, so a Google Doc needs no second fetch. Give each one its
      current id as a tag (`{#clash-kits}`, `{#step-1-core-extraction}`; keep a
      tag it already has), so it moves even if the text was edited since.
      Never tick a box that isn't ticked there.
@@ -157,23 +168,29 @@ plus carrying over what the existing docs already plan for that folder.
      doc. Link it with `Needs: {#network:live-reload}` instead of copying it.
    - New items come from the code, with evidence, as in Initialize. No
      `[next]`, and no status section.
-5. **Validate.** Save the draft outside the repo. `ddd parse <draft>
+6. **Validate.** Save the draft outside the repo. `ddd parse <draft>
    --outline` should report no warnings. Then `ddd doc suggest <draft-path>
    --file <draft>`: every carried item should be in `overlap` with
    `how: tag` and the id you meant. Anything else in `overlap` was copied by
    accident.
-6. **Write** as Initialize does: a Markdown file (ask before overwriting
+7. **Write** as Initialize does: a Markdown file (ask before overwriting
    one; leave it uncommitted), or a Google Doc created **once** from the
    Markdown, read back and checked with `ddd parse <draft> --compare <read-back>`.
-7. **Add it:** `ddd doc add NAME <path-or-url> --scope <folder> [--first-name
+   Google Doc: get its `modifiedTime` from the metadata tool just before the
+   read-back and again after it. If the two match, that is the read-back's
+   version.
+8. **Add it:** `ddd doc add NAME <path-or-url> --scope <folder> [--first-name
    NAME] [--test "<cmd as it ran>"] --wait-for ID ...`, with one `--wait-for`
-   for each carried item that is still in the other doc. Then tell the
-   developer exactly what to cut: the doc, and the headings with their
-   lines. Sync every doc. The new one reports `held` until the cut, so it
-   gets no fetch and no items yet. If they cut it during the run and say
-   so, sync again: the items move with their state, branches and history.
-   Write back, `commit-state`, and report the doc's path or link, its item
-   count, what moved (or still waits) and what you would queue first.
+   for each carried item that is still in the other doc. Google Doc, when the
+   two times matched: add `--file <read-back> --doc-version <modifiedTime>`.
+   The read-back is kept for the first sync after the cut, which then skips
+   fetching the new doc if it is still at that version (`saved_fetch_used`).
+   Then tell the developer exactly what to cut: the doc, and the headings
+   with their lines. Don't sync again: step 1 did, and the new doc would
+   only report `held`. If they cut it during the run and say so, sync every
+   doc: the items move with their state, branches and history. Then
+   `commit-state`, and report the doc's path or link, its item count, what
+   moved (or still waits) and what you would queue first.
 
 ## Waiting for a cut
 
@@ -184,7 +201,9 @@ in the old doc, it becomes a second, separate item. `doc add --wait-for ID`
 with `waiting_for` (the items still in their doc) and records nothing, until
 every one has left: cut from a Markdown file, removed in this run's pending
 diff of the other doc, or already synced as removed. Then the hold lifts by
-itself, and that same sync reports the moves.
+itself, and that same sync reports the moves. A read-back saved with `doc
+add --file --doc-version` survives the hold; `ddd info` shows it as the doc's
+`saved_fetch`. A diff with a newer `--doc-version` drops it as stale.
 
 `ddd info` lists a doc's `wait_for`. If the developer decides to keep both
 copies after all: `ddd config set doc.wait_for "[]" --doc NAME`.

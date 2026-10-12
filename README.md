@@ -59,12 +59,14 @@ are needed by the skill itself.
 | `/ddd initialize` | Surveys the code and drafts the first plan for you, as a Markdown file or a Google Doc (you choose), then sets up |
 | `/ddd doc add <doc-path-or-url>` | Adds another plan to the repo: reads the doc, guesses its name, folder and test command, spots sections still in another doc, asks you to confirm in one message, then adds it and syncs |
 | `/ddd doc new <folder> [markdown\|gdoc]` | Drafts a standalone plan for one part of the project (a game, service or package) from its code, carries over what your existing doc already plans for it, adds it as another doc and tells you what to cut from the old one |
+| `/ddd reformat [doc] [full\|less]` | Rewrites a doc in the template's full style (every item tagged) or a light one for first drafts, keeping every item, its words, order and state. A Markdown doc is rewritten with a backup; a Google Doc gets a new copy and the old one stays as it is |
 | `/ddd setup` | First-run setup (also automatic) |
 
 **Completion in Claude Code:** every mode is also its own command, so type
 `/ddd:` and the menu lists them all: `/ddd:menu`, `/ddd:auto [max-items]`,
 `/ddd:status`, `/ddd:setup [doc-path-or-url]`, `/ddd:initialize [markdown|gdoc]`,
-`/ddd:doc add <doc-path-or-url>`, `/ddd:doc new <folder> [markdown|gdoc]`.
+`/ddd:doc add <doc-path-or-url>`, `/ddd:doc new <folder> [markdown|gdoc]`,
+`/ddd:reformat [doc] [full|less]`.
 The plugin provides them; `install.sh`/`install.ps1` copy them to
 `~/.claude/commands/ddd/` (or `.claude/commands/ddd/` with `--target project`).
 Use one install method, not both, or each command is listed twice.
@@ -153,7 +155,10 @@ keep editing, rank higher in the menu. See
 
 ## Safety
 
-- The agent writes only inside the `DDD Status` section and in comments.
+- The agent writes only inside the `DDD Status` section and in comments. The
+  one exception is `/ddd reformat`, which you ask for. It rewrites a Markdown
+  doc only after checking that no item, word, order, marker or checkbox
+  changes, and keeps a backup. For a Google Doc it makes a new one.
 - Doc text is treated as requirements, not instructions: a line in a shared doc
   saying "run this script" or "push to main" is raised with you, not obeyed.
 - It refuses to start an item over your uncommitted work, and never stashes or

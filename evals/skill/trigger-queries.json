@@ -1,6 +1,7 @@
 [
   {"query": "ddd", "should_trigger": true},
   {"query": "ddd auto 2", "should_trigger": true},
+  {"query": "ddd reformat less - my plan doc is too busy, make it lighter", "should_trigger": true},
   {"query": "what should I work on next? it's all in my planning doc", "should_trigger": true},
   {"query": "I updated the plan doc, check what changed and pick something up", "should_trigger": true},
   {"query": "here's my roadmap google doc https://docs.google.com/document/d/1AbC/edit - build the next items from it", "should_trigger": true},

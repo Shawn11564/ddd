@@ -222,13 +222,27 @@
       "setup": "After eval 1, plus a committed folder scientific/ holding trig.py (sin and cos that raise NotImplementedError, a TODO for tan) and test_trig.py (one skipped test).",
       "prompt": "ddd doc new scientific",
       "expectations": [
-        "Runs `ddd.py survey --scope scientific`, reads scientific/ (trig.py, test_trig.py), and sees Scientific mode in `scope.related_items`",
+        "Syncs docs/plan.md before drafting, then runs `ddd.py survey --scope scientific`, reads scientific/ (trig.py, test_trig.py), and sees Scientific mode in `scope.related_items` (not Background or the title heading)",
         "Asks once, with recommendations: Markdown at scientific/plan.md or a Google Doc, the doc name scientific, the existing doc's name calculator, the test command, and whether Scientific mode moves to the new doc (recommended)",
         "After 'Markdown, move it': drafts from the folder's code (sin, cos, tan with evidence, the skipped test as a known issue) and carries Scientific mode over word for word, tagged {#scientific-mode} and still [blocked]",
         "Validates the draft with `parse --outline` and `doc suggest` before writing scientific/plan.md, which it leaves uncommitted",
         "Runs `ddd.py doc add scientific scientific/plan.md --scope scientific --first-name calculator --wait-for scientific-mode` (plus `--test` only if a command ran)",
-        "Tells the developer to cut the Scientific mode section from docs/plan.md, never cuts it itself, and reports the new doc as held until then",
+        "Tells the developer to cut the Scientific mode section from docs/plan.md, never cuts it itself, and reports the new doc as held until then; does not sync again after `doc add`",
         "Edits docs/plan.md only inside its status section; does not push or merge"
+      ]
+    },
+    {
+      "id": 19,
+      "name": "reformat-full-then-less",
+      "setup": "After eval 1.",
+      "prompt": "ddd reformat full",
+      "expectations": [
+        "Syncs first, and asks nothing about the doc or the style (one doc, style given)",
+        "Drafts docs/plan.md in the full style with each work item tagged by its id from `ddd.py items`: the headings' tag and markers ({#basic-operations} [next], {#scientific-mode} [blocked]) on their own line under them, {#multiply-two-numbers} on its task, Background keeping [notes]",
+        "Keeps every item's words, order, checkbox and Done when: line, with no new work and no status section in the draft",
+        "Runs `ddd.py reformat check` until it reports ok, then `ddd.py reformat write`, then syncs with no questions",
+        "Reports the 7 items kept, the tags added and the backup at .ddd/tmp/before-reformat.md",
+        "Follow-up 'ddd reformat less': drops the tags (nothing is active or needed), keeps [next], [blocked], [notes], the checkboxes and the Done when: lines, and checks before writing"
       ]
     }
   ]

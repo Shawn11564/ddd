@@ -60,6 +60,32 @@ First version.
   sync (`held`, `waiting_for`) until the developer cuts those items from the
   old doc, so they move with their state instead of becoming duplicates
   (behaviour eval 18).
+- Fixes from the first real New doc run (McPlanet's Clash plan, a Google Doc):
+  - `related_items` listed all 75 items as related, because the plan's intro
+    named Clash and everything under the title heading came along. The title
+    heading is left out, and only a heading whose title or tag names the
+    folder brings the rest of its section; a passing mention in a section's
+    text lists that heading alone. The survey output dropped from 31 KB to
+    8 KB.
+  - `doc add --file SAVED --doc-version V` keeps the read-back for the first
+    sync after the cut, which skips fetching the new doc while it is
+    unchanged (`saved_fetch_used`). The run had fetched it twice.
+  - New doc mode syncs before drafting, so carried items are the docs'
+    current text, and doesn't sync again after `doc add`.
+  - Recorded Google Docs capabilities are re-checked against the tools each
+    session offers. A `targeted_edit: false` recorded before the Google Docs
+    connector was connected had stopped status writes, and the run told
+    the developer that no tool could edit the doc. Capabilities record the
+    tool's name.
+- Reformat mode (`ddd reformat [doc] [full|less]`, `/ddd:reformat`, behaviour
+  eval 19). It rewrites a doc in the template's full style, with every work
+  item tagged with its id, or a light one for first drafts with tags only
+  where needed. The plan stays the same. `ddd reformat check` refuses a
+  draft that loses, adds, rewords, moves, reorders, re-marks or
+  re-ticks an item; only tags and `[notes]` sections may change.
+  `reformat write` replaces a Markdown doc, keeping its status section and
+  a backup. A Google Doc gets a new copy, and `reformat relink` points ddd
+  at it; the old doc is never touched.
 - `Needs: {#tag}` / `{#doc:tag}`: an item waits until those items are done
   (`rank` lists it under `waiting`, the status section under **Waiting**), or
   stacks on a need that is awaiting review (`signals.stack_on`).

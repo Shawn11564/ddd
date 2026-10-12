@@ -9,7 +9,7 @@
 | `.ddd/snapshot.md` | yes | The doc text as of the last accepted sync; git history keeps older ones |
 | `.ddd/log.jsonl` | yes | Append-only audit trail |
 | `.ddd/README.md` | yes | One-paragraph explanation for humans |
-| `.ddd/tmp/` | no (`.ddd/.gitignore`) | Fetched doc text, pending diff |
+| `.ddd/tmp/` | no (`.ddd/.gitignore`) | Fetched doc text, pending diff, and `fetched.json`: a read-back kept by `doc add --file` for the first sync |
 
 With several docs ([multi-doc.md](multi-doc.md)), `config.json` and
 `log.jsonl` stay at `.ddd/` and each doc's `items.json`, `snapshot.md` and
@@ -28,7 +28,7 @@ With several docs ([multi-doc.md](multi-doc.md)), `config.json` and
 | `hot_half_life_days` | 7 | Decay of the "hot" ranking signal |
 | `auto.on_blocker` | `stop` | `stop` or `skip` in auto mode |
 | `auto.max_items` | null | Default item limit for auto mode |
-| `capabilities.read` / `.targeted_edit` / `.comments` | null | Cached MCP capabilities (Google Docs) |
+| `capabilities.read` / `.targeted_edit` / `.comments` | null | The tool that does each job, or `false` (Google Docs). A cache: re-check it against the tools each session offers ([backends.md](backends.md#google-docs-through-an-mcp)) |
 | `doc.tab` | none | Google Doc tab to write the status section to, from the URL's `?tab=` |
 
 Several docs: `doc` is replaced by `docs` {name: {type, path, url, id, tab,
@@ -93,6 +93,7 @@ One JSON object per line, each with `ts` and `type`:
 | `status-write`, `config` | what was written or set |
 | `move` | `item`, `from` (qualified id in the doc it left) |
 | `doc-migrate`, `doc-add`, `doc-rename`, `doc-remove` | `doc`, and `source` / `from` |
+| `reformat`, `doc-relink` | `path` and `items` kept / `from` and `to` URLs |
 
 With several docs every entry also has `doc`.
 
@@ -105,12 +106,13 @@ commits": `ddd log --item login`.
 |---|---|
 | `init --doc PATH\|URL [--base B] [--test CMD] [--force]` | Create `.ddd/` |
 | `info` | Config, state counts, flags, git branch and dirty files |
+| `reformat check DRAFT` / `reformat write DRAFT` / `reformat relink URL [--old-version V]` (all `[--doc NAME]`) | Reformat mode ([reformat.md](reformat.md)). `check`: does the draft keep every item, its words, section, order, markers and checkbox (`ok`, `problems`, `kept`, `tagged`, `added_notes`). `write`: replace a Markdown doc with a draft that passes, keeping its status section and saving the old text to `tmp/before-reformat.md`. `relink`: point a Google Doc's config at its reformatted copy (`former_urls` keeps the old URL). All refuse an open diff or a doc edited since the sync (exit 3) |
 | `parse FILE [--outline] [--compare OTHER]` | Parse a doc and print its items, one line per item, or what differs in OTHER (no state needed; for validating drafts and conversions) |
 | `survey [--limit N] [--scope DIR]` | Facts about the project for Initialize mode: stack, manifests, tests, CI, docs, code markers, git with `base_guess`/`on_base` (no state needed). `--scope`: one folder only, plus `scope` with its test command, git history and the tracked `related_items` about it (New doc mode) |
-| `diff [FILE] [--doc-version V]` | Compare the doc with the last sync; saves a pending diff. Google Doc: without FILE, only reports whether V (modified time or revision) differs from the last synced version (`fetch_skipped` / `fetch_needed`) |
+| `diff [FILE] [--doc-version V]` | Compare the doc with the last sync; saves a pending diff. Google Doc: without FILE, only reports whether V (modified time or revision) differs from the last synced version (`fetch_skipped` / `fetch_needed`), or diffs the read-back `doc add --file` kept at version V (`saved_fetch_used`) |
 | `accept [--match K=ID] [--new K] [--split ID=K,K] [--merge ID,ID=K] [--accept-proposed]` | Apply the pending diff (several docs: every pending diff at once; keys as `DOC:KEY`; `--move DOC:KEY=DOC:ID`, `--no-move DOC:KEY`) |
 | `rank [--queued] [--limit N]` | Work candidates with signals (`stack_on`, `needs_unresolved`), `blocked`, and `waiting` (items whose `Needs:` are not done); `--queued` for auto mode |
-| `doc add NAME PATH\|URL [--scope DIR] [--test CMD] [--first-name NAME] [--wait-for ID]...` / `doc list` / `doc rename OLD NEW` / `doc remove NAME [--force]` | Several docs ([multi-doc.md](multi-doc.md)) |
+| `doc add NAME PATH\|URL [--scope DIR] [--test CMD] [--first-name NAME] [--wait-for ID]... [--file SAVED --doc-version V]` / `doc list` / `doc rename OLD NEW` / `doc remove NAME [--force]` | Several docs ([multi-doc.md](multi-doc.md)). `--file` with `--doc-version` (Google Doc): keep the text already fetched for the first sync, which uses it (`saved_fetch_used`) while the doc is still at version V; `info` shows it as `saved_fetch` |
 | `doc suggest PATH\|URL [--file SAVED]` | Best-guess `doc add` settings for a doc not tracked yet: name, the existing doc's name, scope, test command, items already tracked elsewhere, and what to confirm. Changes nothing; works without `.ddd/` ([multi-doc.md](multi-doc.md#adding-a-doc-interactively)) |
 | `items [--state S]` / `show ID` | List items / full record |
 | `set ID [STATE] [--note] [--question] [--branch] [--commit SHA] [--comment-id ID --comment-kind K] [--clear-flags]` | Update an item |

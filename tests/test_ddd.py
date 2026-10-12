@@ -12,6 +12,7 @@ Run from the repo root:  python -m unittest discover -s tests -v
   migration, moves between docs, Needs, per-doc branches, trailers, settings.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -919,6 +920,102 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ReformatTests(RepoCase):
+    """`ddd reformat`: the same doc in the full or the less style, with every
+    item, its words, section, order, markers and checkbox kept."""
+
+    FULL = ("# Plan\n\n## Sign-in\n\n{#auth} [next]\n\n- [ ] Login form {#login}\n"
+            "  - Done when: bad passwords show an error\n- [ ] Logout button {#logout-button}\n\n"
+            "## Dark mode\n\n{#dark-mode}\n\nTheme toggle.\n\n"
+            "## How this doc works [notes]\n\n- `[next]` queues an item for `ddd auto`.\n")
+    LESS = ("# Plan\n\n## Sign-in [next]\n\n- [ ] Login form\n  Done when: bad passwords show an error\n"
+            "- [ ] Logout button\n\n## Dark mode\n\nTheme toggle.\n")
+
+    def draft(self, text):
+        path = os.path.join(self.root, ".ddd", "tmp", "draft.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return path
+
+    def test_full_style_pins_ids_and_keeps_every_item(self):
+        self.init_and_sync()
+        self.ddd("status-block", "--write", "plan.md")
+        out = self.ddd("reformat", "check", self.draft(self.FULL))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual((out["kept"], out["tagged"], len(out["added_notes"])), (5, 4, 1))
+        written = self.ddd("reformat", "write", self.draft(self.FULL))
+        self.assertEqual(self.read(written["backup"]).split("## DDD Status")[0].rstrip("\n"), self.PLAN.rstrip("\n"))
+        text = self.read("plan.md")
+        self.assertTrue(text.startswith(self.FULL))
+        self.assertIn("## DDD Status", text)  # the status section is kept
+        diff = self.ddd("diff")
+        self.assertFalse(diff["needs_input"])
+        self.assertEqual(diff["summary"]["new"], 1)  # the notes section
+        self.assertEqual(diff["summary"]["removed"], 0)
+        self.ddd("accept")
+        self.assertEqual(self.ddd("show", "logout-button")["tag"], "logout-button")
+
+    def test_less_style_drops_tags_the_text_still_matches(self):
+        self.init_and_sync()
+        self.build("login", "login\n")
+        out = self.ddd("reformat", "check", self.draft(self.LESS))
+        self.assertTrue(out["ok"], out)
+        self.ddd("reformat", "write", self.draft(self.LESS))
+        diff = self.ddd("diff")
+        self.assertFalse(diff["needs_input"], diff)
+        self.assertEqual((diff["summary"]["new"], diff["summary"]["removed"]), (0, 0))
+        self.ddd("accept")
+        self.assertEqual(self.ddd("show", "login")["state"], "in-progress")
+
+    def test_check_reports_what_a_reformat_must_not_change(self):
+        self.init_and_sync()
+        bad = ("# Plan\n\n## Dark mode\n\nTheme toggle.\n\n## Sign-in {#auth}\n\n"
+               "- [ ] Sign-in form {#login}\n  - Done when: bad passwords show an error\n"
+               "Logout button\n- [ ] Remember me\n")
+        out = self.ddd("reformat", "check", self.draft(bad))
+        self.assertFalse(out["ok"])
+        got = {(p["problem"], p.get("id") or p["title"]) for p in out["problems"]}
+        self.assertEqual(got, {("lost", "logout-button"), ("new", "Remember me"), ("reordered", "dark-mode"),
+                               ("changed", "auth"), ("changed", "login")})
+        changes = {p["id"]: p["changes"] for p in out["problems"] if p["problem"] == "changed"}
+        self.assertEqual(changes, {"auth": ["edited", "unqueued"], "login": ["renamed"]})
+        self.assertIn("fix the problems", self.ddd("reformat", "write", self.draft(bad), code=1)["error"])
+        self.assertEqual(self.read("plan.md"), self.PLAN)
+
+    def test_write_refuses_a_doc_edited_since_the_sync(self):
+        self.init_and_sync()
+        self.write("plan.md", self.PLAN + "\n## Search\n\n- [ ] Search box\n")
+        self.assertIn("changed since the last sync", self.ddd("reformat", "write", self.draft(self.LESS),
+                                                             code=3)["error"])
+        self.ddd("diff")
+        self.assertIn("finish the sync", self.ddd("reformat", "check", self.draft(self.LESS), code=3)["error"])
+
+    def test_a_google_doc_is_relinked_to_its_reformatted_copy(self):
+        self.ddd("init", "--doc", "https://docs.google.com/document/d/old123/edit", "--force")
+        os.makedirs(os.path.join(self.root, ".ddd", "tmp"), exist_ok=True)
+        self.write(".ddd/tmp/doc.md", self.PLAN)
+        self.ddd("diff", ".ddd/tmp/doc.md", "--doc-version", "v1")
+        self.ddd("accept")
+        self.assertIn("a new doc", self.ddd("reformat", "write", self.draft(self.FULL), code=1)["error"])
+        readback = self.draft(self.FULL)
+        self.assertTrue(self.ddd("reformat", "check", readback)["ok"])
+        url = "https://docs.google.com/document/d/new456/edit"
+        self.assertIn("old doc changed", self.ddd("reformat", "relink", url, "--old-version", "v2",
+                                                 code=3)["error"])
+        self.ddd("reformat", "relink", url, "--old-version", "v1")
+        doc = self.ddd("info")["config"]["doc"]
+        self.assertEqual((doc["id"], doc["former_urls"]), ("new456", ["https://docs.google.com/document/d/old123/edit"]))
+        self.assertTrue(self.ddd("diff", "--doc-version", "v1")["fetch_needed"])  # the new doc's own versions
+        diff = self.ddd("diff", readback, "--doc-version", "n1")
+        self.assertFalse(diff["needs_input"])
+        self.assertEqual(diff["summary"]["removed"], 0)
+
+    def test_relink_is_for_a_google_doc(self):
+        self.init_and_sync()
+        self.assertIn("for a Google Doc", self.ddd("reformat", "relink", "https://docs.google.com/document/d/x/edit",
+                                                   code=1)["error"])
+
+
 class MultiDocTests(RepoCase):
     """Several docs in one .ddd/ (references/multi-doc.md): migration, moves
     between docs, Needs, per-doc branches, trailers and settings."""
@@ -1214,8 +1311,29 @@ class MultiDocTests(RepoCase):
         self.assertEqual(scope["git"]["recent"][0][11:], "clash module")
         self.assertEqual([(r["id"], r["why"]) for r in scope["related_items"]],
                          [("finish-clash", ["title"]), ("step-1-core-extraction", ["in section"]),
-                          ("clash-kits", ["in section"])])
+                          ("clash-kits", ["title", "in section"])])
         self.assertIn("folder inside the project", self.ddd("survey", "--scope", "nope", code=1)["error"])
+
+    def test_survey_scope_ignores_passing_mentions(self):
+        """The McPlanet run (2026-10-12): the plan's intro named Clash, so the
+        title heading matched and every item under it came along as "in
+        section": all 75 items were "related" to games/clash."""
+        self.write("plan.md", "# Network plan\n\nThe network and its games, Orbit and Clash.\n\n"
+                              "## Overview\n\nCode: games/orbit, games/clash.\n\n"
+                              "## Dungeons\n\n- [ ] Dungeon core {#dungeons-core}\n\n"
+                              "## Finish Clash\n\n- [x] Step 1: core extraction\n"
+                              "- [ ] Step 4: roles and kits {#clash-kits}\n\n"
+                              "## Season one\n\n{#clash-season}\n\n- [ ] Map art\n\n"
+                              "## Play-test by hand\n\nOrbit and Clash need two accounts.\n\n"
+                              "- [ ] Orbit's hand test {#hand-orbit}\n- [ ] Clash step 3's hand test {#hand-clash}\n")
+        self.init_and_sync()
+        self.clash_module()
+        related = self.ddd("survey", "--scope", "games/clash")["scope"]["related_items"]
+        self.assertEqual([(r["id"], r["why"]) for r in related],
+                         [("overview", ["path", "body"]), ("finish-clash", ["title"]),
+                          ("step-1-core-extraction", ["in section"]), ("clash-kits", ["title", "in section"]),
+                          ("clash-season", ["title"]), ("map-art", ["in section"]),
+                          ("play-test-by-hand", ["body"]), ("hand-clash", ["title"])])
 
     def test_wait_for_holds_the_first_sync_until_the_cut(self):
         """doc new: the new doc carries the Clash section (tagged with its ids)
@@ -1257,6 +1375,56 @@ class MultiDocTests(RepoCase):
         self.assertEqual(self.ddd("info")["docs"][1]["wait_for"], [])
         # the folder's own doc is not "related" to it
         self.assertEqual(self.ddd("survey", "--scope", "games/clash")["scope"]["related_items"], [])
+
+    def test_doc_add_keeps_the_read_back_for_the_first_sync(self):
+        """doc new with a Google Doc: the read-back after creating it stands in
+        for the first sync's fetch while the doc is still at that version (the
+        McPlanet run fetched it twice)."""
+        self.init_and_sync()
+        self.clash_module()
+        url = "https://docs.google.com/document/d/clash123/edit"
+        self.write(".ddd/tmp/clash.b64", base64.b64encode(self.CLASH.encode("utf-8")).decode("ascii"))
+        self.assertIn("go together", self.ddd("doc", "add", "clash", url, "--first-name", "network",
+                                              "--file", ".ddd/tmp/clash.b64", code=1)["error"])
+        self.assertIn("for a Google Doc", self.ddd("doc", "add", "clash", "games/clash/plan.md", "--first-name",
+                                                   "network", "--file", "x", "--doc-version", "v1", code=1)["error"])
+        added = self.ddd("doc", "add", "clash", url, "--first-name", "network", "--scope", "games/clash",
+                         "--wait-for", "clash-kits", "--file", ".ddd/tmp/clash.b64", "--doc-version", "v1")
+        self.assertEqual(added["saved_fetch"], {"doc_version": "v1", "items": 4})
+        self.assertTrue(self.ddd("diff", "--doc", "clash", "--doc-version", "v1")["held"])
+        self.write("plan.md", self.network_only())  # the cut
+        self.ddd("diff", "--doc", "network")
+        self.assertIn("fetch it", self.ddd("diff", "--doc", "clash", code=1)["error"])  # no version: kept
+        self.assertEqual(self.ddd("info")["docs"][1]["saved_fetch"], "v1")
+        clash = self.ddd("diff", "--doc", "clash", "--doc-version", "v1")
+        self.assertTrue(clash["saved_fetch_used"])
+        self.assertEqual(sorted((m["from"], m["how"]) for m in clash["joint"]["moves"]),
+                         [("network:clash-kits", "tag"), ("network:finish-clash", "exact"),
+                          ("network:step-1-core-extraction", "exact")])
+        self.ddd("accept")
+        self.assertEqual(self.ddd("show", "clash:clash-kits")["doc"], "clash")
+        self.assertIsNone(self.ddd("info")["docs"][1]["saved_fetch"])
+        self.assertTrue(self.ddd("diff", "--doc", "clash", "--doc-version", "v1")["fetch_skipped"])
+
+    def test_a_saved_fetch_goes_stale_when_the_doc_changes(self):
+        self.init_and_sync()
+        url = "https://docs.google.com/document/d/clash123/edit"
+        self.write(".ddd/tmp/clash.md", self.CLASH)
+        self.ddd("doc", "add", "clash", url, "--first-name", "network", "--file", ".ddd/tmp/clash.md",
+                 "--doc-version", "v1")
+        out = self.ddd("diff", "--doc", "clash", "--doc-version", "v2")  # edited since the read-back
+        self.assertTrue(out["fetch_needed"])
+        self.assertIsNone(self.ddd("info")["docs"][1]["saved_fetch"])
+
+    def test_reformat_needs_the_doc_named(self):
+        self.init_and_sync()
+        self.split()
+        self.sync_all()
+        self.ddd("accept")
+        self.write("draft.md", self.CLASH.replace("## Finish Clash", "## Finish Clash [notes]"))
+        self.assertEqual(self.ddd("reformat", "check", "draft.md", code=2)["docs"], ["network", "clash"])
+        out = self.ddd("reformat", "check", "draft.md", "--doc", "clash")
+        self.assertEqual([(p["problem"], p["id"]) for p in out["problems"]][:1], [("changed", "clash:finish-clash")])
 
     def test_wait_for_can_be_dropped(self):
         self.init_and_sync()
